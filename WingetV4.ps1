@@ -86,6 +86,59 @@ Ensure-Module "Microsoft.WinGet.Client"
 Ensure-Module "PSWindowsUpdate"
 
 # === Sezione 0: Scrittura delle informazioni di sistema ===
+# === X.2 - Funzione per controllare e installare un modulo se non presente ===
+function Ensure-Module {
+    param ([string]$moduleName)
+    if (-not (Get-Module -ListAvailable -Name $moduleName)) {
+        Write-Log "Modulo $moduleName non installato. Installazione in corso..."
+        Install-Module -Name $moduleName -Force -Confirm:$false
+        Write-Host "`n"
+    } else {
+        Write-Log "Modulo $moduleName gia' installato."
+        Write-Host "`n"
+    }
+    Import-Module $moduleName
+}
+
+# === X.3 - Funzione per installare o aggiornare applicativi con WinGet ===
+function Install-Or-Update-WinGetPackage {
+    param ([string]$packageId)
+
+    Write-Log "Verifica dello stato del pacchetto: $packageId"
+
+    # Controlla se l'applicazione e' già installata
+    $installedPackage = Get-WinGetPackage | Where-Object { $_.Id -eq $packageId }
+
+    if ($installedPackage) {
+        Write-Log "Il pacchetto $packageId e' gia' installato (Versione: $($installedPackage.Version))."
+
+        # Controlla se e' disponibile un aggiornamento
+        $updateAvailable = winget upgrade --id $packageId --accept-source-agreements | Out-String
+        if ($updateAvailable -match $packageId) {
+            Write-Log "Aggiornamento disponibile per $packageId. Avvio aggiornamento..."
+            $result = winget upgrade --id $packageId --accept-source-agreements | Out-String
+        } else {
+            Write-Log "Nessun aggiornamento disponibile per $packageId."
+            return
+        }
+    } else {
+        Write-Log "Il pacchetto $packageId non e' installato. Avvio installazione..."
+        $result = Install-WinGetPackage $packageId | Select-Object -Property Name,Status,InstallerErrorCode | Out-String
+    }
+
+    Write-Log "Risultato dell'operazione su $packageId :`n$result"
+    Write-Host "`n"
+}
+
+Write-Log "*****************INZIO ESECUZIONE SCRIPT*****************"
+
+# Installato modulo Powershell Winget per loggare andamento installazione e update
+# Installato modulo PSWindowsUpdate per la gestione degli aggiornamenti di Windows
+# Controllo e installazione dei moduli solo se necessario
+Ensure-Module "Microsoft.WinGet.Client"
+Ensure-Module "PSWindowsUpdate"
+
+# === Sezione 0: Scrittura delle informazioni di sistema ===
 
 # Ottieni le informazioni richieste
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -96,12 +149,26 @@ $user = whoami
 
 # Scrivi informazioni di sistema nel file
 Write-Log "=== Informazioni di Sistema ==="
+Write-Log "=== Informazioni di Sistema ==="
 Write-Log "Timestamp: $timestamp"
 Write-Log "Modello: $computerModel"
 Write-Log "Seriale: $serialNumber"
 Write-Log "Dominio: $domain"
 Write-Log "Utente: $user"
 Write-Log "Informazioni di sistema scritte correttamente nel file."
+Write-Host "`n"
+
+# === Sezione 1: Installazione Applicazioni ===
+
+# Installazione o aggiornamento delle applicazioni necessarie
+foreach ($app in $apps) {
+    Install-Or-Update-WinGetPackage -packageId $app
+}
+
+# Attesa dell'utente prima di continuare
+Write-Host "Premi un tasto per continuare..."
+[System.Console]::ReadKey($true) | Out-Null
+Write-Host "`n"
 Write-Host "`n"
 
 # === Sezione 1: Installazione Applicazioni ===
@@ -123,8 +190,10 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v IsContinuousInnovationOptedIn /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti rapidi abilitati."
     Write-Host "`n"
+    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la modifica dell'impostazione degli aggiornamenti rapidi: $_"
+    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -135,8 +204,10 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v AllowOptionalContent /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti facoltativi saranno installati automaticamente."
     Write-Host "`n"
+    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la configurazione degli aggiornamenti facoltativi: $_"
+    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -147,8 +218,10 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" /v EnableMicrosoftUpdate /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti per altri prodotti Microsoft abilitati."
     Write-Host "`n"
+    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante l'abilitazione degli aggiornamenti per altri prodotti Microsoft: $_"
+    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -163,8 +236,10 @@ Try {
     Set-ItemProperty -Path $edgeKey -Name "DefaultSearchProviderName" -Value "Google"
     Write-Log "Motore di ricerca di Edge modificato con successo in Google."
     Write-Host "`n"
+    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la modifica del motore di ricerca in Edge: $_"
+    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -177,18 +252,22 @@ Try {
     powercfg /change standby-timeout-dc 0
     Write-Log "Impostazioni di risparmio energetico configurate su 'Mai' con successo."
     Write-Host "`n"
+    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la configurazione delle impostazioni di risparmio energetico: $_"
+    Write-Host "`n"
     Write-Host "`n"
 }
 
 # === Sezione 7: Avvio manuale di Windows Update ===
+# Cerca gli aggiornamenti disponibili
 # Cerca gli aggiornamenti disponibili
 Write-Log "Ricerca degli aggiornamenti disponibili..."
 $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll
 
 if ($updates) {
     Write-Log "Trovati $(($updates | Measure-Object).Count) aggiornamenti. Avvio installazione..."
+    
     
     # Installa gli aggiornamenti e registra l'output nel log
     Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot | Out-File -Append -FilePath $logPath
@@ -198,9 +277,11 @@ if ($updates) {
 } else {
     Write-Log "Nessun aggiornamento disponibile."
     Write-Host "`n"
+    Write-Host "`n"
 }
 Write-Host "Premi un tasto per continuare..."
 [System.Console]::ReadKey($true) | Out-Null
+Write-Host "`n"
 Write-Host "`n"
 
 # === Chiusura dello Script ===
