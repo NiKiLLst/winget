@@ -9,7 +9,7 @@ $apps = @(
     "7zip.7zip"
     "VideoLAN.VLC"
     # "Google.Chrome"
-    "Mozilla.Firefox"
+    #"Mozilla.Firefox"
     "Notepad++.Notepad++"
     "Amazon.AWSCLI"
     "PuTTY.PuTTY"
@@ -195,16 +195,6 @@ if ($updates) {
 
     Write-Log "Installazione aggiornamenti completata."
     Write-Host "`n"
-
-    # Controlla se e' necessario un riavvio
-    if (Get-WURebootStatus) {
-        Write-Log "Riavvio richiesto. Il sistema si riavviera' tra 1 minuto..."
-        Start-Sleep -Seconds 60
-        Restart-Computer -Force
-    } else {
-        Write-Log "Riavvio non necessario."
-        Write-Host "`n"
-    }
 } else {
     Write-Log "Nessun aggiornamento disponibile."
     Write-Host "`n"
@@ -215,3 +205,49 @@ Write-Host "`n"
 
 # === Chiusura dello Script ===
 Write-Log "`n*****************Script completato con successo.*****************"
+
+# Percorso del file di stato
+$stateFile = "C:\Temp\JoinDomainState.txt"
+
+# Controlla se lo script è stato eseguito prima del riavvio
+if (Test-Path $stateFile) {
+    # Legge il nome del PC dal file
+    $newPCName = Get-Content $stateFile
+    Remove-Item $stateFile -Force
+    
+    # Richiesta delle credenziali di dominio
+    $domain = "tuodominio.local"  # Sostituisci con il tuo dominio
+    $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio"
+
+    # Esegui il join a dominio
+    Add-Computer -DomainName $domain -Credential $cred -Restart
+
+    exit
+}
+
+# Prompt per l'utente
+$answer = Read-Host "Vuoi inserire il pc a dominio? (y/n)"
+
+if ($answer -eq 'y') {
+    # Richiedi il nuovo nome del PC
+    $newPCName = Read-Host "Inserisci il nuovo nome del computer"
+
+    # Salva il nome del PC nel file di stato
+    $newPCName | Out-File -FilePath $stateFile -Force
+
+    # Rinominare il computer
+    Rename-Computer -NewName $newPCName -Force
+
+    # Riavvio necessario
+    Restart-Computer -Force
+}
+
+# Controlla se e' necessario un riavvio per eseguire gli aggiornamenti di Windows Update
+if (Get-WURebootStatus) {
+    Write-Log "Riavvio richiesto. Il sistema si riavviera' tra 1 minuto..."
+    Start-Sleep -Seconds 60
+    Restart-Computer -Force
+} else {
+    Write-Log "Riavvio non necessario."
+    Write-Host "`n"
+}
