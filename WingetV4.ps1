@@ -1,15 +1,25 @@
 # Percorso del file di log
 $logpath = "D:\LogsWinget.txt"
 
+# Percorso del file di stato per join al dominio
+$stateFile = "C:\Temp\JoinDomainState.txt"
+
+# Dominio a cui aggiungere il pc
+$domain = "tuodominio.local"  
+
+# Nuovo nome del computer
+$newPCName = "PC-001"
+
 # Lista delle applicazioni da installare/aggiornare
 $apps = @(
+    #"Se Non vuoi installare qualcosa, basta che ci metti un # davanti"
     "Microsoft.Edge"
     "Microsoft.Office"
     "Adobe.Acrobat.Reader.64-bit"
     "7zip.7zip"
     "VideoLAN.VLC"
-    # "Google.Chrome"
-    #"Mozilla.Firefox"
+    "Google.Chrome"
+    "Mozilla.Firefox"
     "Notepad++.Notepad++"
     "Amazon.AWSCLI"
     "PuTTY.PuTTY"
@@ -53,7 +63,7 @@ function Install-Or-Update-WinGetPackage {
 
     Write-Log "Verifica dello stato del pacchetto: $packageId"
 
-    # Controlla se l'applicazione e' già installata
+    # Controlla se l'applicazione e' gia' installata
     $installedPackage = Get-WinGetPackage | Where-Object { $_.Id -eq $packageId }
 
     if ($installedPackage) {
@@ -76,6 +86,16 @@ function Install-Or-Update-WinGetPackage {
     Write-Log "Risultato dell'operazione su $packageId :`n$result"
     Write-Host "`n"
 }
+
+# === X.4 - Funzione con escape per i caratteri speciali per la match ===
+# COMMENTATA PER VEDERE SE TORNA A FUNZIONARE IL CONTROLLO DELLE VERSIONI
+# Escapa i caratteri speciali nella stringa
+#$escapedPackageId = [regex]::Escape($packageId) 
+
+# QUESTA LA VERSIONE ORIGINALE
+# Usa la versione escapata per il confronto
+#if ($updateAvailable -match $escapedPackageId) {
+#if ($updateAvailable -match $packageId) {
 
 Write-Log "*****************INZIO ESECUZIONE SCRIPT*****************"
 
@@ -106,7 +126,7 @@ function Install-Or-Update-WinGetPackage {
 
     Write-Log "Verifica dello stato del pacchetto: $packageId"
 
-    # Controlla se l'applicazione e' già installata
+    # Controlla se l'applicazione e' gia' installata
     $installedPackage = Get-WinGetPackage | Where-Object { $_.Id -eq $packageId }
 
     if ($installedPackage) {
@@ -169,19 +189,6 @@ foreach ($app in $apps) {
 Write-Host "Premi un tasto per continuare..."
 [System.Console]::ReadKey($true) | Out-Null
 Write-Host "`n"
-Write-Host "`n"
-
-# === Sezione 1: Installazione Applicazioni ===
-
-# Installazione o aggiornamento delle applicazioni necessarie
-foreach ($app in $apps) {
-    Install-Or-Update-WinGetPackage -packageId $app
-}
-
-# Attesa dell'utente prima di continuare
-Write-Host "Premi un tasto per continuare..."
-[System.Console]::ReadKey($true) | Out-Null
-Write-Host "`n"
 
 # === Sezione 2: Abilitare "Ottieni gli ultimi aggiornamenti non appena sono disponibili" ===
 
@@ -190,10 +197,8 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v IsContinuousInnovationOptedIn /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti rapidi abilitati."
     Write-Host "`n"
-    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la modifica dell'impostazione degli aggiornamenti rapidi: $_"
-    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -204,10 +209,8 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v AllowOptionalContent /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti facoltativi saranno installati automaticamente."
     Write-Host "`n"
-    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la configurazione degli aggiornamenti facoltativi: $_"
-    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -218,10 +221,8 @@ Try {
     reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" /v EnableMicrosoftUpdate /t REG_DWORD /d 1 /f
     Write-Log "Impostazione completata: aggiornamenti per altri prodotti Microsoft abilitati."
     Write-Host "`n"
-    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante l'abilitazione degli aggiornamenti per altri prodotti Microsoft: $_"
-    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -236,10 +237,8 @@ Try {
     Set-ItemProperty -Path $edgeKey -Name "DefaultSearchProviderName" -Value "Google"
     Write-Log "Motore di ricerca di Edge modificato con successo in Google."
     Write-Host "`n"
-    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la modifica del motore di ricerca in Edge: $_"
-    Write-Host "`n"
     Write-Host "`n"
 }
 
@@ -252,15 +251,12 @@ Try {
     powercfg /change standby-timeout-dc 0
     Write-Log "Impostazioni di risparmio energetico configurate su 'Mai' con successo."
     Write-Host "`n"
-    Write-Host "`n"
 } Catch {
     Write-Log "Errore durante la configurazione delle impostazioni di risparmio energetico: $_"
-    Write-Host "`n"
     Write-Host "`n"
 }
 
 # === Sezione 7: Avvio manuale di Windows Update ===
-# Cerca gli aggiornamenti disponibili
 # Cerca gli aggiornamenti disponibili
 Write-Log "Ricerca degli aggiornamenti disponibili..."
 $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll
@@ -277,28 +273,16 @@ if ($updates) {
 } else {
     Write-Log "Nessun aggiornamento disponibile."
     Write-Host "`n"
-    Write-Host "`n"
 }
 Write-Host "Premi un tasto per continuare..."
 [System.Console]::ReadKey($true) | Out-Null
 Write-Host "`n"
-Write-Host "`n"
-
-# === Chiusura dello Script ===
-Write-Log "`n*****************Script completato con successo.*****************"
-
-# Percorso del file di stato
-$stateFile = "C:\Temp\JoinDomainState.txt"
 
 # Controlla se lo script è stato eseguito prima del riavvio
 if (Test-Path $stateFile) {
     # Legge il nome del PC dal file
     $newPCName = Get-Content $stateFile
     Remove-Item $stateFile -Force
-    
-    # Richiesta delle credenziali di dominio
-    $domain = "tuodominio.local"  # Sostituisci con il tuo dominio
-    $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio"
 
     # Esegui il join a dominio
     Add-Computer -DomainName $domain -Credential $cred -Restart
@@ -310,8 +294,9 @@ if (Test-Path $stateFile) {
 $answer = Read-Host "Vuoi inserire il pc a dominio? (y/n)"
 
 if ($answer -eq 'y') {
-    # Richiedi il nuovo nome del PC
-    $newPCName = Read-Host "Inserisci il nuovo nome del computer"
+
+    # Richiesta delle credenziali di dominio
+    $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio"
 
     # Salva il nome del PC nel file di stato
     $newPCName | Out-File -FilePath $stateFile -Force
@@ -332,3 +317,6 @@ if (Get-WURebootStatus) {
     Write-Log "Riavvio non necessario."
     Write-Host "`n"
 }
+
+# === Chiusura dello Script ===
+Write-Log "`n*****************Script completato con successo.*****************"
