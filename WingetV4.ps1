@@ -1,3 +1,5 @@
+Version: 1.2
+
 # Percorso del file di log
 $logpath = "D:\LogsWinget.txt"
 
