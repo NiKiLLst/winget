@@ -1,4 +1,4 @@
-Version: 1.2
+#Version: 1.2
 
 # Percorso del file di log
 $logpath = "D:\LogsWinget.txt"
@@ -23,7 +23,7 @@ $apps = @(
     "Google.Chrome"
     "Mozilla.Firefox"
     "Notepad++.Notepad++"
-    "Amazon.AWSCLI"
+    #"Amazon.AWSCLI"
     "PuTTY.PuTTY"
     "Postman.Postman"
     "Microsoft.PowerShell"
@@ -108,59 +108,6 @@ Ensure-Module "Microsoft.WinGet.Client"
 Ensure-Module "PSWindowsUpdate"
 
 # === Sezione 0: Scrittura delle informazioni di sistema ===
-# === X.2 - Funzione per controllare e installare un modulo se non presente ===
-function Ensure-Module {
-    param ([string]$moduleName)
-    if (-not (Get-Module -ListAvailable -Name $moduleName)) {
-        Write-Log "Modulo $moduleName non installato. Installazione in corso..."
-        Install-Module -Name $moduleName -Force -Confirm:$false
-        Write-Host "`n"
-    } else {
-        Write-Log "Modulo $moduleName gia' installato."
-        Write-Host "`n"
-    }
-    Import-Module $moduleName
-}
-
-# === X.3 - Funzione per installare o aggiornare applicativi con WinGet ===
-function Install-Or-Update-WinGetPackage {
-    param ([string]$packageId)
-
-    Write-Log "Verifica dello stato del pacchetto: $packageId"
-
-    # Controlla se l'applicazione e' gia' installata
-    $installedPackage = Get-WinGetPackage | Where-Object { $_.Id -eq $packageId }
-
-    if ($installedPackage) {
-        Write-Log "Il pacchetto $packageId e' gia' installato (Versione: $($installedPackage.Version))."
-
-        # Controlla se e' disponibile un aggiornamento
-        $updateAvailable = winget upgrade --id $packageId --accept-source-agreements | Out-String
-        if ($updateAvailable -match $packageId) {
-            Write-Log "Aggiornamento disponibile per $packageId. Avvio aggiornamento..."
-            $result = winget upgrade --id $packageId --accept-source-agreements | Out-String
-        } else {
-            Write-Log "Nessun aggiornamento disponibile per $packageId."
-            return
-        }
-    } else {
-        Write-Log "Il pacchetto $packageId non e' installato. Avvio installazione..."
-        $result = Install-WinGetPackage $packageId | Select-Object -Property Name,Status,InstallerErrorCode | Out-String
-    }
-
-    Write-Log "Risultato dell'operazione su $packageId :`n$result"
-    Write-Host "`n"
-}
-
-Write-Log "*****************INZIO ESECUZIONE SCRIPT*****************"
-
-# Installato modulo Powershell Winget per loggare andamento installazione e update
-# Installato modulo PSWindowsUpdate per la gestione degli aggiornamenti di Windows
-# Controllo e installazione dei moduli solo se necessario
-Ensure-Module "Microsoft.WinGet.Client"
-Ensure-Module "PSWindowsUpdate"
-
-# === Sezione 0: Scrittura delle informazioni di sistema ===
 
 # Ottieni le informazioni richieste
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -170,7 +117,6 @@ $domain = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain
 $user = whoami
 
 # Scrivi informazioni di sistema nel file
-Write-Log "=== Informazioni di Sistema ==="
 Write-Log "=== Informazioni di Sistema ==="
 Write-Log "Timestamp: $timestamp"
 Write-Log "Modello: $computerModel"
@@ -259,6 +205,7 @@ Try {
 }
 
 # === Sezione 7: Avvio manuale di Windows Update ===
+
 # Cerca gli aggiornamenti disponibili
 Write-Log "Ricerca degli aggiornamenti disponibili..."
 $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll
@@ -288,7 +235,7 @@ if (Test-Path $stateFile) {
 
     # Esegui il join a dominio
     Add-Computer -DomainName $domain -Credential $cred -Restart
-
+    Write-Log "`n*****************Script completato con successo.*****************"
     exit
 }
 
@@ -302,6 +249,7 @@ if ($answer -eq 'y') {
 
     # Salva il nome del PC nel file di stato
     $newPCName | Out-File -FilePath $stateFile -Force
+    Write-Log "`n**************** Modificato nome PC - Riavvio *****************"
 
     # Rinominare il computer
     Rename-Computer -NewName $newPCName -Force
