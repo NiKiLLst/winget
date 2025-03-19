@@ -36,40 +36,41 @@ $appbynames = @(
 #winget install --id=Mozilla.Firefox -e  --accept-source-agreements --accept-package-agreements 
 
 # === Sezione X: Funzioni utilizzate nello script ===
+
+# === X - Funzione per inizializzare path e file usati per i log ===
+# Funzione per inizializzare i file (da chiamare all'inizio dello script)
+function Initialize-Files {
+    param (
+        [string[]]$filePaths
+    )
+
+    foreach ($filePath in $filePaths) {
+        $folderPath = Split-Path -Path $filePath -Parent
+
+        # Crea la cartella se non esiste
+        if (-Not (Test-Path $folderPath)) {
+            New-Item -Path $folderPath -ItemType Directory -Force | Out-Null
+        }
+
+        # Crea il file se non esiste
+        if (-Not (Test-Path $filePath)) {
+            New-Item -Path $filePath -ItemType File -Force | Out-Null
+        }
+    }
+
+    Write-Output "✅ File di log e stato verificati e inizializzati correttamente."
+}
+
 # === X.1 - Funzione di Log per scrivere su schermo e su file ===
+
 function Write-Log {
     param (
         [string]$message
     )
+
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$TimeStamp - $message" | Out-File -Append -FilePath $logPath -Encoding UTF8
     Write-Output $message
-}
-
-try {
-    # Controlla se il file esiste
-    Write-Log "Verifica se esiste ed e' scrivibile il Logfile"
-    if (-Not (Test-Path $stateFile)) {
-        # Tenta di creare il file
-        New-Item -Path $stateFile -ItemType File -Force -ErrorAction Stop | Out-Null
-        Write-Log "Logfile creato con successo: $stateFile"
-    } else {
-        Write-Log "Il file esiste gia': $stateFile"
-    }
-
-    # Testa se il file è scrivibile
-    try {
-        "$TimeStamp" | Out-File -Append -FilePath $stateFile -ErrorAction Stop
-        Write-Log "Scrittura nel Logfile riuscita: $stateFile"
-        Write-Host "`n"
-        Set-Content -Path $stateFile -Value $null
-    } catch {
-        Write-Log "Errore: impossibile scrivere nel Logfile $stateFile. Errore: $_"
-        Write-Host "`n"
-    }
-} catch {
-    Write-Log "Errore: impossibile creare il Logfile $stateFile. Errore: $_"
-    Write-Host "`n"
 }
 
 # === X.2 - Funzione per controllare e installare un modulo se non presente ===
@@ -173,6 +174,9 @@ function Crea-UtenteAdmin {
         $repeat = Read-Host "Vuoi creare un altro utente? (S/N)"
     } while ($repeat -match "^[sS]$")
 }
+
+# Inizializza i file all'inizio dello script
+Initialize-Files -filePaths @($logPath, $stateFile)
 
 Write-Log "*****************INZIO ESECUZIONE SCRIPT*****************"
 
