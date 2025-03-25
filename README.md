@@ -13,6 +13,10 @@ Visualizza le estensioni dei file
 Loggare gli aggiornamenti non riusciti
 Verificare perche' non prendere le versioni dei file
 
+V1.5
+! Effettuata pulizia del codice e utilizzo Write-Log invece di Write-Output per function Crea-UtenteAdmin
+- Rimosso file winget.ps1 in favore di wingetV4.ps1
+
 V1.4
 !Varie modifiche per try/catch errori regedit
 +Aggiunta creazione utenti locali

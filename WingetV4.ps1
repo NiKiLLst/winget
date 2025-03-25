@@ -17,23 +17,21 @@ $apps = @(
     "Adobe.Acrobat.Reader.64-bit"
     "7zip.7zip"
     "VideoLAN.VLC"
-    "Google.Chrome"
-    "Mozilla.Firefox"
+    #"Google.Chrome"
+    #"Mozilla.Firefox"
     #"Amazon.AWSCLI"
-    "PuTTY.PuTTY"
-    "Postman.Postman"
-    "Microsoft.PowerShell"
-    "Microsoft.WindowsTerminal"
-    "Microsoft.VisualStudioCode"
-    "Git.Git"
-    "FlipperDevicesInc.qFlipper"
+    #"PuTTY.PuTTY"
+    #"Postman.Postman"
+    #"Microsoft.PowerShell"
+    #"Microsoft.WindowsTerminal"
+    #"Microsoft.VisualStudioCode"
+    #"Git.Git"
+    #"FlipperDevicesInc.qFlipper"
 )
 
 $appbynames = @(
-    "Notepad++.Notepad++"
+    #"Notepad++.Notepad++"
 )
-
-#winget install --id=Mozilla.Firefox -e  --accept-source-agreements --accept-package-agreements 
 
 # === Sezione X: Funzioni utilizzate nello script ===
 
@@ -67,7 +65,6 @@ function Write-Log {
     param (
         [string]$message
     )
-
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$TimeStamp - $message" | Out-File -Append -FilePath $logPath -Encoding UTF8
     Write-Output $message
@@ -80,9 +77,10 @@ function Ensure-Module {
         Write-Log "Modulo $moduleName non installato. Installazione in corso..."
         Install-Module -Name $moduleName -Force -Confirm:$false
     } else {
-        Write-Log "Modulo $moduleName gia' installato."
+        Write-Log "✅ Modulo $moduleName gia' installato."
     }
     Import-Module $moduleName
+    Write-Log "✅ Modulo $moduleName importato."
 }
 
 # === X.3 - Funzione per installare o aggiornare applicativi con WinGet ===
@@ -127,8 +125,6 @@ function Install-Or-Update-WinGetPackage {
 
 # === X.4 - Funzione di creazione utenti amministratori locali ===
 function Crea-UtenteAdmin {
-    $logPath = "C:\Temp\Log_Creazione_Utenti.txt"
-
     do {
         $response = Read-Host "Vuoi creare un nuovo utente locale? (S/N)"
         
@@ -138,40 +134,39 @@ function Crea-UtenteAdmin {
 
             # Controllo se l'utente esiste già
             if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-                Write-Output "❌ L'utente '$username' esiste già!"
-                Add-Content -Path $logPath -Value "$(Get-Date) - ❌ L'utente '$username' esiste già."
+                Write-Log "❌ L'utente '$username' esiste già!"
             } else {
                 try {
                     # Creazione utente
                     New-LocalUser -Name $username -Password $password -FullName $username -Description "Utente creato via script" -ErrorAction Stop
-                    Write-Output "✅ Utente '$username' creato con successo."
-                    Add-Content -Path $logPath -Value "$(Get-Date) - ✅ Utente '$username' creato con successo."
+                    Write-Log "✅ Utente '$username' creato con successo."
 
                     # Aggiunta al gruppo amministratori
                     $adminGroup = [System.Security.Principal.WindowsBuiltInRole]::Administrator
                     Add-LocalGroupMember -Group $adminGroup -Member $username -ErrorAction Stop
-                    Write-Output "🔑 L'utente '$username' è stato aggiunto agli amministratori."
-                    Add-Content -Path $logPath -Value "$(Get-Date) - 🔑 Utente '$username' aggiunto agli amministratori."
-
-                    Write-Output "⚠️ Riavvia il PC ed esegui lo script sotto il nuovo utente '$username'."
-                    Add-Content -Path $logPath -Value "$(Get-Date) - ⚠️ Riavvio consigliato per il nuovo utente '$username'."
+                    Write-Log "🔑 L'utente '$username' è stato aggiunto agli amministratori."
+                    Write-Host "`n"
+                    Write-Log "⚠️ Riavvia il PC ed esegui lo script sotto il nuovo utente '$username'."
+                    Write-Host "`n"
 
                 } catch {
-                    Write-Output "❌ Errore durante la creazione dell'utente: $_"
-                    Add-Content -Path $logPath -Value "$(Get-Date) - ❌ Errore: $_"
+                    Write-Log "❌ Errore durante la creazione dell'utente: $_"
                 }
             }
 
             # Pausa per leggere eventuali errori
             Start-Sleep -Seconds 5
+            
         } else {
-            Write-Output "❌ Creazione utente annullata."
+            Write-Log "❌ Creazione utente annullata."
             Add-Content -Path $logPath -Value "$(Get-Date) - ❌ Creazione utente annullata."
+            Write-Host "`n"
             break
         }
 
         # Chiede se si vuole creare un altro utente
         $repeat = Read-Host "Vuoi creare un altro utente? (S/N)"
+        Write-Host "`n"
     } while ($repeat -match "^[sS]$")
 }
 
@@ -182,8 +177,6 @@ Write-Log "*****************INZIO ESECUZIONE SCRIPT*****************"
 
 # Richiesta creazione utenti locali
 Crea-UtenteAdmin
-Write-Host "Premi un tasto per continuare..."
-[System.Console]::ReadKey($true) | Out-Null
 Write-Host "`n"
 
 # Installato modulo Powershell Winget per loggare andamento installazione e update
@@ -451,7 +444,7 @@ if ($newPCName -ne $currentPCName) {
     Write-Log "Inserisci le credenziali di amministratore di dominio"
     $cred = Get-Credential
     Add-Computer -DomainName $domain -Credential $cred -Force
-    Write-Log "`nPC aggiunto al dominio con successo. Riavvio in corso..."
+    Write-Log "`nPC aggiunto al dominio con successo. Il sistema si riavviera' tra 1 minuto..."
     Start-Sleep -Seconds 60
     Restart-Computer -Force
 }
