@@ -1,12 +1,10 @@
 ﻿#========================================
 # Winget Automated Deployment Script
-# Version: V5 (December 2025)
+# Version: V6 (March 2026)
 #========================================
 # Provisioning automatico workstation Windows
 # con software, aggiornamenti e configurazioni
 #========================================
-
-#Version: 1.4
 
 # === VERIFICA PRIVILEGI AMMINISTRATORI ===
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -211,6 +209,62 @@ function New-LocalAdminUser {
     } while ($repeat -match "^[sS]$")
 }
 
+# === X.5 - Funzioni per gestione attività pianificata di resume ===
+$resumeTaskName = "WingetResumeTask"
+
+function Register-ResumeTask {
+    try {
+        $scriptPath = $PSCommandPath
+        $action   = New-ScheduledTaskAction -Execute "powershell.exe" `
+                        -Argument "-NonInteractive -WindowStyle Normal -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                        -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+        Register-ScheduledTask -TaskName $resumeTaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force | Out-Null
+        Write-Log "[OK] Attivita' pianificata '$resumeTaskName' registrata."
+    } catch {
+        Write-Log "[ERRORE] Impossibile registrare l'attivita' pianificata: $_"
+    }
+}
+
+function Unregister-ResumeTask {
+    try {
+        if (Get-ScheduledTask -TaskName $resumeTaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $resumeTaskName -Confirm:$false
+            Write-Log "[OK] Attivita' pianificata '$resumeTaskName' rimossa."
+        }
+    } catch {
+        Write-Log "[ERRORE] Impossibile rimuovere l'attivita' pianificata: $_"
+    }
+}
+
+# === X.6 - Funzioni per gestione file di stato (JSON con savepoint) ===
+function Write-StateFile {
+    param ([hashtable]$state)
+    try {
+        $state | ConvertTo-Json -Compress | Out-File -FilePath $stateFile -Force -Encoding UTF8
+        Write-Log "[OK] Savepoint aggiornato: Action=$($state.Action), Step=$($state.Step)"
+    } catch {
+        Write-Log "[ERRORE] Impossibile scrivere il file di stato: $_"
+    }
+}
+
+function Read-StateFile {
+    try {
+        if (Test-Path $stateFile) {
+            $content = Get-Content $stateFile -Raw -Encoding UTF8
+            if ($content -match '\S') {
+                return $content | ConvertFrom-Json
+            }
+        }
+    } catch {
+        Write-Log "[ATTENZIONE] File di stato non leggibile come JSON: $_"
+    }
+    return $null
+}
+
 # Inizializza i file all'inizio dello script
 Initialize-Files -filePaths @($logPath, $stateFile)
 
@@ -233,6 +287,33 @@ try {
 New-LocalAdminUser
 Write-Host "`n"
 
+# === Sezione Iniziale: Rinomina PC ===
+Write-Log "`n=== Rinomina PC ==="
+$currentPCName = $env:COMPUTERNAME
+Write-Host "Nome PC attuale: $currentPCName"
+$newPCName = Read-Host "Inserisci il nuovo nome PC (lascia vuoto per mantenere '$currentPCName')"
+
+if ([string]::IsNullOrWhiteSpace($newPCName)) {
+    $newPCName = $currentPCName
+}
+
+if ($newPCName -ne $currentPCName) {
+    Write-Log "Rinomina PC: '$currentPCName' -> '$newPCName'"
+    Write-StateFile @{ Action = "RenameOnly"; Step = "Renamed"; DesiredComputerName = $newPCName }
+    try {
+        Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
+        Write-Log "[OK] PC rinominato. Registrazione task di resume e riavvio in corso..."
+        Register-ResumeTask
+        Start-Sleep -Seconds 5
+        Restart-Computer -Force
+    } catch {
+        Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
+    }
+} else {
+    Write-Log "Nome PC invariato: '$currentPCName'. Nessun riavvio necessario."
+}
+Write-Host "`n"
+
 # Installato modulo Powershell Winget per loggare andamento installazione e update
 # Installato modulo PSWindowsUpdate per la gestione degli aggiornamenti di Windows
 # Controllo e installazione dei moduli solo se necessario
@@ -240,79 +321,132 @@ Install-ModuleIfMissing "Microsoft.WinGet.Client"
 Install-ModuleIfMissing "PSWindowsUpdate"
 Write-Host "`n"
 
-# === Sezione 0: Verifica se e' iniziata la procedura di join a dominio ===
-# Controlla se lo script è stato eseguito prima del riavvio
-if ((Test-Path $stateFile) -and ((Get-Content $stateFile) -match '\S')) {
-    # Legge il nome del PC dal file
-    $currentPCName = $env:COMPUTERNAME
-    Write-Log "Ripresa del processo di Join al dominio"
-    Write-Log "`nNome PC attuale: $currentPCName"
-    $confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
-    if ($confirmPCName -ne 'y') {
-        $newPCName = Read-Host "Inserisci il nuovo nome PC"
-    } else {
+# === Sezione 0: Resume da savepoint (stateFile JSON) ===
+$resumeState = Read-StateFile
+if ($null -ne $resumeState) {
+    Write-Log "=== Ripresa da savepoint: Action=$($resumeState.Action), Step=$($resumeState.Step) ==="
+    Unregister-ResumeTask
+
+    # --- Ripresa dopo rinomina standalone ---
+    if ($resumeState.Action -eq "RenameOnly") {
+        Write-Log "[OK] Rinomina completata. Rimozione savepoint e proseguimento script normale."
+        Remove-Item $stateFile -Force
+        # Prosegue con il resto dello script (nessun exit)
+    }
+
+    # --- Ripresa dopo rinomina pre-join: ora occorre fare il join ---
+    elseif ($resumeState.Action -eq "JoinDomain" -and $resumeState.Step -eq "Renamed") {
+        Write-Log "Ripresa join al dominio dopo rinomina."
+        $currentPCName = $env:COMPUTERNAME
+
+        Write-Host "`nNome PC attuale: $currentPCName"
+        $confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
+        if ($confirmPCName -ne 'y') {
+            $newPCName = Read-Host "Inserisci il nuovo nome PC"
+        } else {
             $newPCName = $currentPCName
         }
-    
-    Write-Log "`nDominio attuale: $domain"
-    $confirmDomain = Read-Host "Confermi il dominio? (y/n)"
-    if ($confirmDomain -ne 'y') {
-        $domain = Read-Host "Inserisci il nuovo dominio"
-    }
-    Write-Log "Dominio impostato: $domain"
 
-    if ($newPCName -ne $currentPCName) {
-        Write-Log "`nNome PC cambiato. Riavvio tra 60 secondi. Rieseguire lo script dopo il riavvio."
-        Rename-Computer -NewName $newPCName -Force
-        Start-Sleep -Seconds 60
-        Restart-Computer -Force
-    } else {
-        Write-Log "`nNome PC invariato. Procedo con la join al dominio."
-        Write-Log "Inserisci le credenziali di amministratore di dominio"
-        Remove-Item $stateFile -Force
-        try {
-            $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $domain"
-            if ($null -eq $cred) {
-                Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+        $savedDomain = if ($resumeState.Domain) { $resumeState.Domain } else { $domain }
+        Write-Host "`nDominio: $savedDomain"
+        $confirmDomain = Read-Host "Confermi il dominio? (y/n)"
+        if ($confirmDomain -ne 'y') {
+            $savedDomain = Read-Host "Inserisci il nuovo dominio"
+        }
+        Write-Log "Dominio impostato: $savedDomain"
+
+        if ($newPCName -ne $currentPCName) {
+            Write-Log "Nome PC ancora diverso ('$currentPCName' -> '$newPCName'). Rinomina e riavvio."
+            Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $newPCName; Domain = $savedDomain }
+            try {
+                Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
+                Register-ResumeTask
+                Start-Sleep -Seconds 5
+                Restart-Computer -Force
+            } catch {
+                Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
+            }
+        } else {
+            Write-Log "Procedo con il join al dominio '$savedDomain'."
+            try {
+                $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $savedDomain"
+                if ($null -eq $cred) {
+                    Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+                    exit 1
+                }
+                Add-Computer -DomainName $savedDomain -Credential $cred -Force -ErrorAction Stop
+                Write-Log "[OK] PC aggiunto al dominio con successo."
+            } catch {
+                Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
                 exit 1
             }
-            Add-Computer -DomainName $domain -Credential $cred -Force
-            Write-Log "`n[OK] PC aggiunto al dominio con successo. Riavvio tra 60 secondi."
-        } catch {
-            Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
-            exit 1
+            Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
+            Remove-Item $stateFile -Force
+            Write-Log "Riavvio in corso per rendere operativo il join..."
+            Start-Sleep -Seconds 5
+            Restart-Computer -Force
         }
-        Write-Log "`n[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
-        Start-Sleep -Seconds 60
-        Restart-Computer -Force
+        Write-Log "`n*****************Script completato con successo.*****************"
+        exit
     }
-    Write-Log "`n*****************Script completato con successo.*****************"
-    exit
+
+    # --- Ripresa savepoint di progresso ---
+    elseif ($resumeState.Action -eq "Progress") {
+        Write-Log "Ripresa da savepoint progresso: Step=$($resumeState.Step)"
+        Unregister-ResumeTask  # pulizia di sicurezza
+        # stateFile mantenuto: verra' aggiornato man mano che le sezioni completano
+    }
+
+    # --- Stato sconosciuto: pulizia e proseguimento ---
+    else {
+        Write-Log "[ATTENZIONE] Savepoint non riconosciuto (Action=$($resumeState.Action)). Pulizia e proseguimento."
+        Remove-Item $stateFile -Force
+    }
+}
+
+# === Savepoint: determina da dove riprendere ===
+$stepOrder = @("SysInfo", "AppsInstalled", "TweaksApplied", "WindowsUpdate")
+$resumeFromStep = if ($null -ne $resumeState -and $resumeState.Action -eq "Progress") { $resumeState.Step } else { "" }
+
+function Should-RunStep {
+    param ([string]$thisStep)
+    if ([string]::IsNullOrEmpty($script:resumeFromStep)) { return $true }
+    $doneIdx = $script:stepOrder.IndexOf($script:resumeFromStep)
+    $thisIdx  = $script:stepOrder.IndexOf($thisStep)
+    return $thisIdx -gt $doneIdx
 }
 
 # === Sezione 1: Scrittura delle informazioni di sistema ===
+if (Should-RunStep "SysInfo") {
+    # Ottieni le informazioni richieste
+    $computerModel = (Get-CimInstance -ClassName Win32_ComputerSystem).Model
+    $serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
+    $domain = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain
+    $user = whoami
 
-# Ottieni le informazioni richieste
-$computerModel = (Get-CimInstance -ClassName Win32_ComputerSystem).Model
-$serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
-$domain = (Get-CimInstance -ClassName Win32_ComputerSystem).Domain
-$user = whoami
-
-# Scrivi informazioni di sistema nel file
-Write-Log "=== Informazioni di Sistema ==="
-Write-Log "Modello: $computerModel"
-Write-Log "Seriale: $serialNumber"
-Write-Log "Dominio: $domain"
-Write-Log "Utente: $user"
-Write-Log "Informazioni di sistema scritte correttamente nel file."
-Write-Host "`n"
+    # Scrivi informazioni di sistema nel file
+    Write-Log "=== Informazioni di Sistema ==="
+    Write-Log "Modello: $computerModel"
+    Write-Log "Seriale: $serialNumber"
+    Write-Log "Dominio: $domain"
+    Write-Log "Utente: $user"
+    Write-Log "Informazioni di sistema scritte correttamente nel file."
+    Write-Host "`n"
+    Write-StateFile @{ Action = "Progress"; Step = "SysInfo" }
+} else {
+    Write-Log "[SKIP] Sezione 1 (SysInfo) gia' completata."
+}
 
 # === Sezione 2: Installazione Applicazioni ===
-
-# Installazione o aggiornamento delle applicazioni necessarie
-foreach ($app in $apps) {
-    Install-Or-Update-WinGetPackage -packageId $app
-    Write-Host "`n"
+if (Should-RunStep "AppsInstalled") {
+    # Installazione o aggiornamento delle applicazioni necessarie
+    foreach ($app in $apps) {
+        Install-Or-Update-WinGetPackage -packageId $app
+        Write-Host "`n"
+    }
+    Write-StateFile @{ Action = "Progress"; Step = "AppsInstalled" }
+} else {
+    Write-Log "[SKIP] Sezione 2 (AppsInstalled) gia' completata."
 }
 
 # === Sezione 3: Abilitare "Ottieni gli ultimi aggiornamenti non appena sono disponibili" ===
@@ -425,81 +559,89 @@ Try {
     Write-Log "[ERRORE] Errore durante la configurazione delle impostazioni di risparmio energetico: $_"
     Write-Host "`n"
 }
+Write-StateFile @{ Action = "Progress"; Step = "TweaksApplied" }
 
 # === Sezione 9: Avvio manuale di Windows Update ===
+if (Should-RunStep "WindowsUpdate") {
+    # Cerca gli aggiornamenti disponibili
+    Write-Log "Ricerca degli aggiornamenti disponibili..."
+    try {
+        $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll
 
-# Cerca gli aggiornamenti disponibili
-Write-Log "Ricerca degli aggiornamenti disponibili..."
-try {
-    $updates = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll
+        if ($updates) {
+            Write-Log "Trovati $(($updates | Measure-Object).Count) aggiornamenti. Avvio installazione..."
 
-    if ($updates) {
-        Write-Log "Trovati $(($updates | Measure-Object).Count) aggiornamenti. Avvio installazione..."
-        
-        # Installa gli aggiornamenti e registra l'output nel log
-        Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot | Out-File -Append -FilePath $logPath
+            # Installa gli aggiornamenti e registra l'output nel log
+            Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot | Out-File -Append -FilePath $logPath
 
-        Write-Log "Installazione aggiornamenti completata."
-        Write-Host "`n"
-    } else {
-        Write-Log "Nessun aggiornamento disponibile."
+            Write-Log "Installazione aggiornamenti completata."
+            Write-Host "`n"
+        } else {
+            Write-Log "Nessun aggiornamento disponibile."
+            Write-Host "`n"
+        }
+    } catch {
+        Write-Log "[ATTENZIONE] Modulo PSWindowsUpdate non disponibile o errore nella ricerca aggiornamenti: $_"
+        Write-Log "[INFO] Puoi installare gli aggiornamenti manualmente da Impostazioni > Aggiornamento e sicurezza"
         Write-Host "`n"
     }
-} catch {
-    Write-Log "[ATTENZIONE] Modulo PSWindowsUpdate non disponibile o errore nella ricerca aggiornamenti: $_"
-    Write-Log "[INFO] Puoi installare gli aggiornamenti manualmente da Impostazioni > Aggiornamento e sicurezza"
-    Write-Host "`n"
+    Write-StateFile @{ Action = "Progress"; Step = "WindowsUpdate" }
+} else {
+    Write-Log "[SKIP] Sezione 9 (WindowsUpdate) gia' completata."
 }
 
+# === Sezione 10: Join al dominio ===
 $answer = Read-Host "Vuoi inserire il pc a dominio? (y/n)"
 if ($answer -ne 'y') {
-    Write-Log "Operazione annullata dall'utente."
-    exit
-}
-
-$currentPCName = $env:COMPUTERNAME
-Write-Host "`nNome PC attuale: $currentPCName"
-
-$confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
-if ($confirmPCName -ne 'y') {
-    $newPCName = Read-Host "Inserisci il nuovo nome PC"
+    Write-Log "Join al dominio annullato dall'utente."
 } else {
+    $currentPCName = $env:COMPUTERNAME
+    Write-Host "`nNome PC attuale: $currentPCName"
+    $confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
+    if ($confirmPCName -ne 'y') {
+        $newPCName = Read-Host "Inserisci il nuovo nome PC"
+    } else {
         $newPCName = $currentPCName
     }
-Write-Log "Nome PC impostato: $newPCName"
+    Write-Log "Nome PC impostato: $newPCName"
 
-# Salva il nome del PC nel file di stato
-$newPCName | Out-File -FilePath $stateFile -Force
+    Write-Host "`nDominio attuale: $domain"
+    $confirmDomain = Read-Host "Confermi il dominio? (y/n)"
+    if ($confirmDomain -ne 'y') {
+        $domain = Read-Host "Inserisci il nuovo dominio"
+    }
+    Write-Log "Dominio impostato: $domain"
 
-Write-Host "`nDominio attuale: $domain"
-$confirmDomain = Read-Host "Confermi il dominio? (y/n)"
-if ($confirmDomain -ne 'y') {
-    $domain = Read-Host "Inserisci il nuovo dominio"
-}
-Write-Log "Dominio impostato: $domain"
-
-if ($newPCName -ne $currentPCName) {
-    Write-Log "`nNome PC cambiato. Riavvio tra 60 secondi. Rieseguire lo script dopo il riavvio."
-    Rename-Computer -NewName $newPCName -Force
-    Start-Sleep -Seconds 60
-    Restart-Computer -Force
-} else {
-    Write-Log "`nNome PC invariato. Procedo con la join al dominio."
-    Write-Log "Inserisci le credenziali di amministratore di dominio"
-    try {
-        $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $domain"
-        if ($null -eq $cred) {
-            Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+    if ($newPCName -ne $currentPCName) {
+        Write-Log "Nome PC cambiato ('$currentPCName' -> '$newPCName'). Rinomina, salvataggio savepoint e riavvio."
+        Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $newPCName; Domain = $domain }
+        try {
+            Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
+            Register-ResumeTask
+            Start-Sleep -Seconds 5
+            Restart-Computer -Force
+        } catch {
+            Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
+        }
+    } else {
+        Write-Log "Nome PC invariato. Procedo con il join al dominio '$domain'."
+        try {
+            $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $domain"
+            if ($null -eq $cred) {
+                Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+                exit 1
+            }
+            Add-Computer -DomainName $domain -Credential $cred -Force -ErrorAction Stop
+            Write-Log "[OK] PC aggiunto al dominio con successo."
+        } catch {
+            Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
             exit 1
         }
-        Add-Computer -DomainName $domain -Credential $cred -Force
-        Write-Log "`n[OK] PC aggiunto al dominio con successo. Riavvio tra 60 secondi."
-    } catch {
-        Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
-        exit 1
+        Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
+        Write-Log "Riavvio in corso per rendere operativo il join..."
+        Start-Sleep -Seconds 5
+        Restart-Computer -Force
     }
-    Start-Sleep -Seconds 60
-    Restart-Computer -Force
 }
 
 # Controlla se e' necessario un riavvio per eseguire gli aggiornamenti di Windows Update
@@ -518,4 +660,6 @@ try {
 }
 
 # === Chiusura dello Script ===
+if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
+Unregister-ResumeTask
 Write-Log "`n*****************Script completato con successo.*****************"

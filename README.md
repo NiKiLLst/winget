@@ -1,4 +1,4 @@
-# Winget Automated Deployment Script - V5
+# Winget Automated Deployment Script - V6
 
 ## Descrizione
 
@@ -31,10 +31,15 @@ Script PowerShell automatizzato per il provisioning e la configurazione di works
 - Disabilitazione risparmio energetico (disco e standby)
 - Logging completo in `C:\Temp\LogsWinget.txt`
 
-**6. Join Dominio Active Directory**
-- Rinomine PC con verifica e riavvio
-- Join dominio con credenziali admin
-- Gestione stato tra riavvi
+**6. Rinomina PC all'avvio**
+- Prompt iniziale per scegliere un nuovo nome PC prima di qualsiasi installazione
+- Rinomina immediata con riavvio automatico
+- Task pianificato per riprendere lo script dopo il riavvio
+
+**7. Join Dominio Active Directory**
+- Join dominio con credenziali admin real-time
+- Rinomina PC opzionale prima del join
+- Task pianificato per riprendere dopo il riavvio
 - Promemoria spostamento OU
 
 ## Guida per Sistemisti IT
@@ -107,9 +112,10 @@ $apps = @(
 Lo script guida l'utente attraverso le seguenti decisioni:
 
 1. **Creazione Utente Locale**: Consente di creare uno o più utenti admin locali
-2. **Nome PC**: Permette di confermare o modificare il nome del computer
-3. **Dominio**: Permette di confermare o modificare il dominio di destinazione
-4. **Join Dominio**: Chiede conferma e credenziali admin di dominio
+2. **Rinomina PC iniziale**: Propone il nome attuale e chiede se rinominare (subito, prima delle installazioni)
+3. **Nome PC per Join**: Al momento del join dominio, chiede nuovamente conferma/modifica del nome
+4. **Dominio**: Permette di confermare o modificare il dominio di destinazione
+5. **Join Dominio**: Chiede conferma e credenziali admin di dominio real-time
 
 ### Flusso di Esecuzione
 
@@ -117,33 +123,56 @@ Lo script guida l'utente attraverso le seguenti decisioni:
 ┌─────────────────────────────────┐
 │ Verifica Privilegi Admin        │ (avviso se non admin)
 ├─────────────────────────────────┤
+│ Inizializzazione File/Funzioni  │ (log, stateFile, helper functions)
+├─────────────────────────────────┤
 │ Creazione Utenti Locali         │ (opzionale)
 ├─────────────────────────────────┤
-│ Installazione Moduli PowerShell  │ (Microsoft.WinGet.Client, PSWindowsUpdate)
+│ *** RINOMINA PC INIZIALE ***    │ propone nome attuale, chiede nuovo nome
+│                                 │ → se cambia: Rename + Task + Riavvio 1
 ├─────────────────────────────────┤
-│ Controllo Join Dominio Precedente│ (se in ripresa dopo riavvio)
+│ Installazione Moduli PowerShell │ (Microsoft.WinGet.Client, PSWindowsUpdate)
 ├─────────────────────────────────┤
-│ Raccolta Info Sistema           │ (modello, seriale, dominio, utente)
+│ Sezione 0: Resume da Savepoint  │ legge stateFile JSON:
+│ ├─ RenameOnly completata        │ → rimuove task, prosegue normalmente
+│ ├─ JoinDomain/Renamed           │ → chiede conferma, esegue join + Riavvio 2
+│ └─ Progress (step intermedio)   │ → riprende dall'ultimo step completato
 ├─────────────────────────────────┤
-│ Installazione Applicazioni      │ (via WinGet)
+│ Sez.1 Raccolta Info Sistema     │ savepoint: SysInfo
 ├─────────────────────────────────┤
-│ Configurazione Windows Update   │ (aggiornamenti rapidi e facoltativi)
+│ Sez.2 Installazione Applicazioni│ savepoint: AppsInstalled
 ├─────────────────────────────────┤
-│ Configurazione Edge             │ (motore ricerca Google)
+│ Sez.3-8 Tweaks Windows/Registry │ savepoint: TweaksApplied
+│  (Update settings, Edge, Ext,   │
+│   Risparmio Energetico)         │
 ├─────────────────────────────────┤
-│ Visualizzazione Estensioni File │
+│ Sez.9 Windows Update            │ savepoint: WindowsUpdate
 ├─────────────────────────────────┤
-│ Disabilitazione Risparmio Energy│
+│ Sez.10 Join Dominio             │ chiede conferma nome + dominio + credenziali
+│ ├─ Nome cambiato                │ → Rename + Task + Riavvio 2 (poi resume join)
+│ └─ Nome ok                     │ → Add-Computer + Riavvio 3
 ├─────────────────────────────────┤
-│ Ricerca e Installazione Updates │
-├─────────────────────────────────┤
-│ Rinomine PC (se necessario)     │ + Riavvio 1
-├─────────────────────────────────┤
-│ Join Dominio (se necessario)    │ + Riavvio 2
-├─────────────────────────────────┤
-│ Verifica Riavvio Updates        │ + Riavvio 3 (se necessario)
+│ Pulizia (stateFile + Task)      │
 └─────────────────────────────────┘
 ```
+
+### Meccanismo Savepoint e Resume
+
+A partire da V6 lo script salva lo stato di avanzamento in `C:\Temp\JoinDomainState.txt` come JSON. In caso di interruzione imprevista o riavvio, alla prossima esecuzione lo script legge il savepoint e riprende dall'ultimo step completato.
+
+**Struttura savepoint:**
+```json
+{ "Action": "Progress", "Step": "AppsInstalled" }
+```
+
+**Valori `Action` possibili:**
+
+| Action | Step | Significato |
+|---|---|---|
+| `Progress` | `SysInfo` / `AppsInstalled` / `TweaksApplied` / `WindowsUpdate` | Ripresa dall'ultimo step completato |
+| `RenameOnly` | `Renamed` | Riavvio post-rinomina iniziale: riprende normalmente |
+| `JoinDomain` | `Renamed` | Riavvio post-rinomina pre-join: riprende con il join |
+
+**Task pianificato:** `WingetResumeTask` — registrato su SYSTEM prima di ogni riavvio; rimosso automaticamente alla ripresa.
 
 ### Gestione Log
 
@@ -215,9 +244,19 @@ Commentare le sezioni nel codice principale:
 2. **Backup log**: Archiviare regolarmente i log in `C:\Temp\LogsWinget.txt`
 3. **Documenta Personalizzazioni**: Registrare modifiche fatte per poter replicare
 4. **Credenziali**: Non hardcodare credenziali nel file; usare Get-Credential
-5. **Timeout**: Verificare timeout di 60 secondi prima di riavvii, possono essere modificati
+5. **Riavvii**: I riavvii ora hanno un delay di 5 secondi (ridotto da 60s) con task pianificato per la ripresa automatica
+6. **Savepoint**: Lo script riprende automaticamente dall'ultimo step completato; rimuovere manualmente `C:\Temp\JoinDomainState.txt` solo se si vuole ripartire da zero
 
 ### Storico Versioni
+
+**V6** (Marzo 2026)
+- Prompt iniziale per rinomina PC all'avvio dello script (prima delle installazioni)
+- Sistema savepoint JSON per ripresa automatica dopo interruzioni impreviste
+- Task pianificato (`WingetResumeTask`) su SYSTEM per rilancio automatico post-riavvio
+- Sezione 0 riscritta: gestisce `RenameOnly`, `JoinDomain/Renamed`, `Progress` (step intermedi)
+- Sezione 10 join dominio aggiornata: usa `Write-StateFile` e `Register-ResumeTask`
+- Delay riavvio ridotto da 60s a 5s (task pianificato garantisce la ripresa)
+- Funzioni helper: `Register-ResumeTask`, `Unregister-ResumeTask`, `Write-StateFile`, `Read-StateFile`, `Should-RunStep`
 
 **V5** (Dicembre 2025)
 - Aggiunto controllo privilegi admin con warning
