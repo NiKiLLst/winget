@@ -75,7 +75,7 @@ Nel file `Winget.ps1`, sezione all'inizio:
 
 ```powershell
 # Percorso del file di log (modificare se necessario)
-$logpath = "C:\Temp\LogsWinget.txt"
+    $logpath = "$PSScriptRoot\logs\LogsWinget.txt"
 
 # Dominio per join (modificare con il vostro dominio)
 $domain = "tuodominio.local"
@@ -157,7 +157,7 @@ Lo script guida l'utente attraverso le seguenti decisioni:
 
 ### Meccanismo Savepoint e Resume
 
-A partire da V6 lo script salva lo stato di avanzamento in `C:\Temp\JoinDomainState.txt` come JSON. In caso di interruzione imprevista o riavvio, alla prossima esecuzione lo script legge il savepoint e riprende dall'ultimo step completato.
+A partire da V6 lo script salva lo stato di avanzamento in `logs\JoinDomainState.txt` (file relativo allo script: `$PSScriptRoot\logs\JoinDomainState.txt`) come JSON. In caso di interruzione imprevista o riavvio, alla prossima esecuzione lo script legge il savepoint e riprende dall'ultimo step completato.
 
 **Struttura savepoint:**
 ```json
@@ -172,7 +172,16 @@ A partire da V6 lo script salva lo stato di avanzamento in `C:\Temp\JoinDomainSt
 | `RenameOnly` | `Renamed` | Riavvio post-rinomina iniziale: riprende normalmente |
 | `JoinDomain` | `Renamed` | Riavvio post-rinomina pre-join: riprende con il join |
 
-**Task pianificato:** `WingetResumeTask` — registrato su SYSTEM prima di ogni riavvio; rimosso automaticamente alla ripresa.
+**Task pianificato:** `WingetResumeTask` — registrato prima di ogni riavvio; rimosso automaticamente alla ripresa.
+
+### Artefatti generati e archivio
+
+Durante lo sviluppo lo script e i comandi ausiliari possono generare file di debug e output (esempi creati nella workspace locale):
+
+- `milan-inter.html` — pagina di test locale per visualizzare stream (archiviata in `archive_v6.1_2026-03-09`).
+- `matches_today.json`, `v1_response.json` — dump delle risposte API (archiviati in `archive_v6.1_2026-03-09`).
+
+Per evitare di commettere file generati, è presente `.gitignore` che esclude la cartella `logs/` e il savepoint `logs/JoinDomainState.txt`.
 
 ### Gestione Log
 

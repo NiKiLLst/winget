@@ -6,24 +6,69 @@
 # con software, aggiornamenti e configurazioni
 #========================================
 
-# === VERIFICA PRIVILEGI AMMINISTRATORI ===
+# === VERIFICA PRIVILEGI AMMINISTRATORI (auto-elevazione) ===
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
 if (-not $isAdmin) {
-    Write-Host "[ATTENZIONE] Questo script dovrebbe essere eseguito con privilegi amministrativi!"
-    Write-Host "[INFO] Alcune operazioni (installazione moduli, modifiche registro) richiederanno admin."
-    Write-Host "[INFO] Continuando con funzionalita' limitate..."
-    $adminWarningIssued = $true
+    Write-Host "[INFO] Privilegi insufficienti. Riavvio come amministratore..."
+    $scriptPath = $MyInvocation.MyCommand.Path
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`""
+    exit
 } else {
     Write-Host "[OK] Script eseguito con privilegi amministrativi."
-    $adminWarningIssued = $false
 }
 
-# Percorso del file di log
-$logpath = "C:\Temp\LogsWinget.txt"
+# Percorso del file di stato per join al dominio (fisso, relativo allo script)
+$stateFile = "$PSScriptRoot\logs\JoinDomainState.txt"
 
-# Percorso del file di stato per join al dominio
-$stateFile = "C:\Temp\JoinDomainState.txt"
+# === Configurazione percorso log ===
+$configFile = "$PSScriptRoot\winget-config.json"
+$defaultLogPath = "$PSScriptRoot\logs\LogsWinget.txt"
+
+# Leggi l'ultimo percorso usato dal file di configurazione
+if (Test-Path $configFile) {
+    try {
+        $cfg = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($cfg.LogPath) { $defaultLogPath = $cfg.LogPath }
+    } catch {}
+}
+
+# Funzione interna: risolve un percorso inserito (cartella o file) in un percorso file .txt valido
+function Resolve-LogPath {
+    param([string]$inputPath)
+    $defaultLogFileName = "LogsWinget.txt"
+    $p = $inputPath.TrimEnd('\', '/')
+    if (($p -ne "") -and (Test-Path $p -PathType Container)) {
+        return Join-Path $p $defaultLogFileName
+    } elseif ($p -notmatch '\.[a-zA-Z0-9]+$') {
+        return Join-Path $p $defaultLogFileName
+    }
+    return $p
+}
+
+# Normalizza anche il default (potrebbe venire da config con percorso cartella)
+$defaultLogPath = Resolve-LogPath $defaultLogPath
+
+# In modalita' resume automatico (savepoint presente) non chiedere: usa il default salvato
+$_stateExists = (Test-Path $stateFile) -and ((Get-Content $stateFile -Raw -ErrorAction SilentlyContinue) -match '"Action"\s*:\s*"(?:RenameOnly|JoinDomain|ShowSummary)"')
+if ($_stateExists) {
+    $logPath = $defaultLogPath
+} else {
+    Write-Host ""
+    Write-Host "Percorso file di log (file .txt o cartella di destinazione)"
+    $userInput = Read-Host "  [Invio per: $defaultLogPath]"
+    if ([string]::IsNullOrWhiteSpace($userInput)) {
+        $logPath = $defaultLogPath
+    } else {
+        $logPath = Resolve-LogPath $userInput
+        if ($logPath -ne $defaultLogPath) {
+            Write-Host "  -> Log salvato in: $logPath"
+        }
+        try {
+            @{ LogPath = $logPath } | ConvertTo-Json -Compress | Out-File -FilePath $configFile -Force -Encoding UTF8
+        } catch {}
+    }
+}
 
 # Dominio a cui aggiungere il pc
 $domain = "test.local"  
@@ -47,6 +92,11 @@ $apps = @(
     "Git.Git",
     "FlipperDevicesInc.qFlipper"
 )
+
+# Pacchetti alternativi da provare se l'installazione principale fallisce (es. variante locale)
+$appFallbacks = @{
+    "Mozilla.Firefox" = "Mozilla.Firefox.it"
+}
 
 # Nota: alcuni pacchetti (es. Notepad++) potrebbero non funzionare bene con WinGet
 # e richiedono nomi ricerca alternativi - aggiungere qui se necessario
@@ -126,39 +176,63 @@ function Install-Or-Update-WinGetPackage {
     Write-Log "Verifica dello stato del pacchetto: $packageId"
 
     try {
-        # Prova a usare Get-WinGetPackage se disponibile, altrimenti usa winget CLI direttamente
-        $installedPackage = $null
-        try {
-            $installedPackage = Get-WinGetPackage | Where-Object { $_.Id -eq $packageId }
-        } catch {
-            # Se il cmdlet non è disponibile, usa winget CLI
-            Write-Log "[INFO] Cmdlet Get-WinGetPackage non disponibile, usando CLI winget..."
-        }
+        $listOutput = & winget list --id $packageId --exact --accept-source-agreements 2>&1
+        $matchLine  = $listOutput | Where-Object { $_ -match [regex]::Escape($packageId) } | Select-Object -First 1
+        $isInstalled = ($null -ne $matchLine)
 
-        if ($installedPackage) {
-            Write-Log "Il pacchetto $packageId e' gia' installato (Versione: $($installedPackage.Version))."
+        if ($isInstalled) {
+            $parts = $matchLine -split '\s{2,}'
+            $currentVersion = if ($parts.Count -ge 3) { $parts[2].Trim() } else { 'sconosciuta' }
+            Write-Log "Il pacchetto $packageId e' gia' installato (Versione: $currentVersion)."
 
-            # Controlla se e' disponibile un aggiornamento
             Write-Log "Verifica disponibilita' aggiornamento per $packageId..."
-            $output = & winget upgrade --id $packageId --accept-source-agreements 2>&1
-            
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log "[OK] Aggiornamento completato per $packageId"
-            } else {
+            $upgradeOutput = & winget upgrade --id $packageId --exact --accept-source-agreements --accept-package-agreements 2>&1
+            $upgradeText   = $upgradeOutput -join "`n"
+
+            if ($LASTEXITCODE -ne 0) {
+                if ($LASTEXITCODE -eq -1978335212 -or $LASTEXITCODE -eq -1978335189) {
+                    Write-Log "Nessun aggiornamento disponibile per $packageId."
+                    $null = $script:appResults.Add(@{ Id = $packageId; Status = "NoUpdate"; Note = $currentVersion })
+                } else {
+                    Write-Log "[ATTENZIONE] Aggiornamento $packageId - Codice: $LASTEXITCODE"
+                    $null = $script:appResults.Add(@{ Id = $packageId; Status = "ErroreUpdate"; Note = "Codice: $LASTEXITCODE" })
+                }
+            } elseif ($upgradeText -match 'No applicable upgrade|Nessun aggiornamento applicabile|already installed|gia.*installato') {
                 Write-Log "Nessun aggiornamento disponibile per $packageId."
+                $null = $script:appResults.Add(@{ Id = $packageId; Status = "NoUpdate"; Note = $currentVersion })
+            } else {
+                Write-Log "[OK] Aggiornamento completato per $packageId"
+                $null = $script:appResults.Add(@{ Id = $packageId; Status = "Aggiornato"; Note = "" })
             }
         } else {
             Write-Log "Il pacchetto $packageId non e' installato. Avvio installazione..."
-            $output = & winget install --id $packageId --accept-source-agreements --accept-package-agreements 2>&1
-            
+            & winget install --id $packageId --exact --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+
             if ($LASTEXITCODE -eq 0) {
                 Write-Log "[OK] Installazione completata con successo per $packageId"
+                $null = $script:appResults.Add(@{ Id = $packageId; Status = "Installato"; Note = "" })
             } else {
                 Write-Log "[ERRORE] Errore durante l'installazione di $packageId. Codice: $LASTEXITCODE"
+                $installNote = "Codice: $LASTEXITCODE"
+                if ($script:appFallbacks -and $script:appFallbacks.ContainsKey($packageId)) {
+                    $fallbackId = $script:appFallbacks[$packageId]
+                    Write-Log "[INFO] Tentativo con pacchetto alternativo: $fallbackId"
+                    & winget install --id $fallbackId --exact --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Log "[OK] Installazione completata con successo per $fallbackId (alternativo)"
+                        $null = $script:appResults.Add(@{ Id = $packageId; Status = "Installato"; Note = "via $fallbackId" })
+                        return
+                    } else {
+                        Write-Log "[ERRORE] Errore anche con pacchetto alternativo $fallbackId. Codice: $LASTEXITCODE"
+                        $installNote = "Codice: $LASTEXITCODE (alternativo $fallbackId fallito)"
+                    }
+                }
+                $null = $script:appResults.Add(@{ Id = $packageId; Status = "Errore"; Note = $installNote })
             }
         }
     } catch {
         Write-Log "[ERRORE] Errore durante l'operazione su $packageId : $_"
+        $null = $script:appResults.Add(@{ Id = $packageId; Status = "Errore"; Note = $_.ToString() })
     }
 }
 
@@ -197,8 +271,7 @@ function New-LocalAdminUser {
             Start-Sleep -Seconds 5
             
         } else {
-            Write-Log "[ERRORE] Creazione utente annullata."
-            Add-Content -Path $logPath -Value "$(Get-Date) - [ERRORE] Creazione utente annullata."
+            Write-Log "[INFO] Creazione utente annullata."
             Write-Host "`n"
             break
         }
@@ -213,30 +286,35 @@ function New-LocalAdminUser {
 $resumeTaskName = "WingetResumeTask"
 
 function Register-ResumeTask {
+    Write-Log "Registrazione attivita' pianificata '$resumeTaskName' in corso..."
     try {
-        $scriptPath = $PSCommandPath
+        $scriptPath  = $PSCommandPath
+        $currentUser = "$env:USERDOMAIN\$env:USERNAME"
         $action   = New-ScheduledTaskAction -Execute "powershell.exe" `
-                        -Argument "-NonInteractive -WindowStyle Normal -ExecutionPolicy Bypass -File `"$scriptPath`""
-        $trigger   = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+                        -Argument "-WindowStyle Normal -ExecutionPolicy Bypass -File `"$scriptPath`""
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+        $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                         -ExecutionTimeLimit (New-TimeSpan -Hours 2)
         Register-ScheduledTask -TaskName $resumeTaskName -Action $action -Trigger $trigger `
             -Principal $principal -Settings $settings -Force | Out-Null
-        Write-Log "[OK] Attivita' pianificata '$resumeTaskName' registrata."
+        Write-Log "[OK] Attivita' pianificata '$resumeTaskName' registrata. Trigger: AtLogOn, Utente: $currentUser, Script: $scriptPath"
     } catch {
-        Write-Log "[ERRORE] Impossibile registrare l'attivita' pianificata: $_"
+        Write-Log "[ERRORE] Impossibile registrare l'attivita' pianificata '$resumeTaskName': $_"
     }
 }
 
 function Unregister-ResumeTask {
+    Write-Log "Rimozione attivita' pianificata '$resumeTaskName' in corso..."
     try {
         if (Get-ScheduledTask -TaskName $resumeTaskName -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $resumeTaskName -Confirm:$false
-            Write-Log "[OK] Attivita' pianificata '$resumeTaskName' rimossa."
+            Write-Log "[OK] Attivita' pianificata '$resumeTaskName' rimossa con successo."
+        } else {
+            Write-Log "[INFO] Attivita' pianificata '$resumeTaskName' non trovata, nessuna rimozione necessaria."
         }
     } catch {
-        Write-Log "[ERRORE] Impossibile rimuovere l'attivita' pianificata: $_"
+        Write-Log "[ERRORE] Impossibile rimuovere l'attivita' pianificata '$resumeTaskName': $_"
     }
 }
 
@@ -263,6 +341,87 @@ function Read-StateFile {
         Write-Log "[ATTENZIONE] File di stato non leggibile come JSON: $_"
     }
     return $null
+}
+
+# === X.7 - Variabili di tracking e funzione di riepilogo ===
+$script:appResults      = [System.Collections.ArrayList]::new()
+$script:wuResults       = [System.Collections.ArrayList]::new()
+$script:wuCount         = 0
+$script:tweaks          = [ordered]@{}
+$script:summaryFilePath = ""
+
+function Write-Summary {
+    param([switch]$OpenFile)
+    $summaryDir  = Split-Path $logPath -Parent
+    $summaryFile = "$summaryDir\Scheda_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyy-MM-dd').txt"
+
+    $sysInfo  = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $biosInfo = Get-CimInstance Win32_BIOS          -ErrorAction SilentlyContinue
+    $sysModel  = if ($sysInfo)  { $sysInfo.Model }        else { "N/D" }
+    $sysDomain = if ($sysInfo)  { $sysInfo.Domain }       else { "N/D" }
+    $sysSerial = if ($biosInfo) { $biosInfo.SerialNumber } else { "N/D" }
+    $sysUser   = try { whoami } catch { "N/D" }
+
+    $sep   = "=" * 56
+    $lines = [System.Collections.ArrayList]::new()
+    $null = $lines.Add($sep)
+    $null = $lines.Add("  SCHEDA INSTALLAZIONE PC")
+    $null = $lines.Add("  Generata il: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $null = $lines.Add($sep)
+    $null = $lines.Add("")
+    $null = $lines.Add("INFORMAZIONI PC")
+    $null = $lines.Add("  Nome PC  : $($env:COMPUTERNAME)")
+    $null = $lines.Add("  Dominio  : $sysDomain")
+    $null = $lines.Add("  Modello  : $sysModel")
+    $null = $lines.Add("  Seriale  : $sysSerial")
+    $null = $lines.Add("  Utente   : $sysUser")
+    $null = $lines.Add("")
+    $null = $lines.Add("APPLICAZIONI")
+    if ($script:appResults.Count -gt 0) {
+        foreach ($r in $script:appResults) {
+            $tag = switch ($r.Status) {
+                "Installato"   { "[OK] Installato          " }
+                "NoUpdate"     { "[--] Gia' aggiornato     " }
+                "Aggiornato"   { "[OK] Aggiornato          " }
+                "Errore"       { "[KO] Errore installaz.   " }
+                "ErroreUpdate" { "[KO] Errore aggiornamento" }
+                default        { "[??] Stato sconosciuto   " }
+            }
+            $note = if ($r.Note) { "  -> $($r.Note)" } else { "" }
+            $null = $lines.Add("  $tag  $($r.Id)$note")
+        }
+    } else {
+        $null = $lines.Add("  (nessuna app tracciata in questa sessione)")
+    }
+    $null = $lines.Add("")
+    $null = $lines.Add("AGGIORNAMENTI WINDOWS")
+    if ($script:wuCount -gt 0) {
+        $null = $lines.Add("  Totale installati: $($script:wuCount)")
+        foreach ($wu in $script:wuResults) { $null = $lines.Add("    $wu") }
+    } else {
+        $null = $lines.Add("  Nessun aggiornamento installato in questa sessione.")
+    }
+    $null = $lines.Add("")
+    $null = $lines.Add("CONFIGURAZIONI APPLICATE")
+    if ($script:tweaks.Count -gt 0) {
+        foreach ($t in $script:tweaks.GetEnumerator()) {
+            $null = $lines.Add("  $($t.Value)  $($t.Key)")
+        }
+    } else {
+        $null = $lines.Add("  (nessuna configurazione tracciata)")
+    }
+    $null = $lines.Add("")
+    $null = $lines.Add($sep)
+
+    try {
+        if (-not (Test-Path $summaryDir)) { New-Item -Path $summaryDir -ItemType Directory -Force | Out-Null }
+        $lines | Out-File -FilePath $summaryFile -Encoding UTF8 -Force
+        Write-Log "[OK] Scheda installazione salvata: $summaryFile"
+        $script:summaryFilePath = $summaryFile
+        if ($OpenFile) { Start-Process notepad.exe -ArgumentList "`"$summaryFile`"" }
+    } catch {
+        Write-Log "[ATTENZIONE] Impossibile salvare la scheda installazione: $_"
+    }
 }
 
 # Inizializza i file all'inizio dello script
@@ -304,8 +463,11 @@ if ($newPCName -ne $currentPCName) {
         Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
         Write-Log "[OK] PC rinominato. Registrazione task di resume e riavvio in corso..."
         Register-ResumeTask
-        Start-Sleep -Seconds 5
+        Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
+        Start-Sleep -Seconds 3
         Restart-Computer -Force
+        Start-Sleep -Seconds 120  # Attendi l'interruzione da parte del SO
+        exit
     } catch {
         Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
     }
@@ -361,8 +523,11 @@ if ($null -ne $resumeState) {
             try {
                 Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
                 Register-ResumeTask
-                Start-Sleep -Seconds 5
+                Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
+                Start-Sleep -Seconds 3
                 Restart-Computer -Force
+                Start-Sleep -Seconds 120
+                exit
             } catch {
                 Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
             }
@@ -382,11 +547,24 @@ if ($null -ne $resumeState) {
             }
             Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
             Remove-Item $stateFile -Force
-            Write-Log "Riavvio in corso per rendere operativo il join..."
-            Start-Sleep -Seconds 5
+            Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
+            Start-Sleep -Seconds 3
             Restart-Computer -Force
+            Start-Sleep -Seconds 120
+            exit
         }
-        Write-Log "`n*****************Script completato con successo.*****************"
+    }
+
+    # --- Riepilogo post-riavvio aggiornamenti ---
+    elseif ($resumeState.Action -eq "ShowSummary") {
+        Unregister-ResumeTask
+        Remove-Item $stateFile -Force
+        if ($resumeState.SummaryFile -and (Test-Path $resumeState.SummaryFile)) {
+            Write-Log "[OK] Apertura scheda installazione: $($resumeState.SummaryFile)"
+            Start-Process notepad.exe -ArgumentList "`"$($resumeState.SummaryFile)`""
+        } else {
+            Write-Log "[ATTENZIONE] File scheda non trovato: $($resumeState.SummaryFile)"
+        }
         exit
     }
 
@@ -408,7 +586,7 @@ if ($null -ne $resumeState) {
 $stepOrder = @("SysInfo", "AppsInstalled", "TweaksApplied", "WindowsUpdate")
 $resumeFromStep = if ($null -ne $resumeState -and $resumeState.Action -eq "Progress") { $resumeState.Step } else { "" }
 
-function Should-RunStep {
+function Test-StepNeeded {
     param ([string]$thisStep)
     if ([string]::IsNullOrEmpty($script:resumeFromStep)) { return $true }
     $doneIdx = $script:stepOrder.IndexOf($script:resumeFromStep)
@@ -417,7 +595,7 @@ function Should-RunStep {
 }
 
 # === Sezione 1: Scrittura delle informazioni di sistema ===
-if (Should-RunStep "SysInfo") {
+if (Test-StepNeeded "SysInfo") {
     # Ottieni le informazioni richieste
     $computerModel = (Get-CimInstance -ClassName Win32_ComputerSystem).Model
     $serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
@@ -438,7 +616,13 @@ if (Should-RunStep "SysInfo") {
 }
 
 # === Sezione 2: Installazione Applicazioni ===
-if (Should-RunStep "AppsInstalled") {
+if (Test-StepNeeded "AppsInstalled") {
+    # Aggiorna i cataloghi winget prima di qualsiasi operazione
+    # Senza questo, winget usa versioni cached e potrebbe non vedere gli ultimi aggiornamenti
+    Write-Log "Aggiornamento cataloghi winget in corso..."
+    & winget source update 2>&1 | Out-Null
+    Write-Log "[OK] Cataloghi winget aggiornati."
+
     # Installazione o aggiornamento delle applicazioni necessarie
     foreach ($app in $apps) {
         Install-Or-Update-WinGetPackage -packageId $app
@@ -457,8 +641,10 @@ reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v IsContinuousInnov
 # Controlla se il comando è andato a buon fine
 if ($LASTEXITCODE -eq 0) {
     Write-Log "Impostazione completata: aggiornamenti rapidi abilitati."
+    $script:tweaks["Aggiornamenti rapidi"] = "[OK]"
 } else {
     Write-Log "Errore durante la modifica dell'impostazione degli aggiornamenti rapidi. Codice errore: $LASTEXITCODE"
+    $script:tweaks["Aggiornamenti rapidi"] = "[KO]"
 }
 Write-Host "`n"
 
@@ -468,30 +654,50 @@ Write-Log "`n=== Configurazione aggiornamenti facoltativi ==="
 reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v AllowOptionalContent /t REG_DWORD /d 1 /f
 if ($LASTEXITCODE -eq 0) {
     Write-Log "Impostazione completata: aggiornamenti facoltativi saranno installati automaticamente."
+    $script:tweaks["Aggiornamenti facoltativi automatici"] = "[OK]"
 } else {
     Write-Log "Errore durante la configurazione degli aggiornamenti facoltativi. Codice errore: $LASTEXITCODE"
+    $script:tweaks["Aggiornamenti facoltativi automatici"] = "[KO]"
 }
 Write-Host "`n"
 
 # === Sezione 5: Abilitare "Ottieni aggiornamenti per altri prodotti Microsoft" ===
-$regPath = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
-$regName = "EnableMicrosoftUpdate"
-
-# Controlla se la chiave esiste
-if (-Not (Test-Path "Registry::$regPath")) {
-    Write-Output "Errore: La chiave di registro non esiste. Creazione della chiave..."
-    New-Item -Path "Registry::$regPath" -Force | Out-Null
+Write-Log "`n=== Abilitazione aggiornamenti per altri prodotti Microsoft ==="
+try {
+    # Metodo principale: registrazione servizio Microsoft Update tramite COM object (affidabile su Win10/11)
+    $svcMgr = New-Object -ComObject "Microsoft.Update.ServiceManager"
+    $svcMgr.AddService2("7971f918-a847-4430-9279-4a52d1efe18d", 7, "") | Out-Null
+    Write-Log "[OK] Aggiornamenti per altri prodotti Microsoft abilitati (Windows Update Service COM)."
+    $script:tweaks["Aggiornamenti altri prodotti Microsoft"] = "[OK]"
+} catch {
+    Write-Log "[ATTENZIONE] Impossibile abilitare tramite COM: $_"
+    Write-Log "[INFO] Tentativo tramite registro di sistema..."
+    $regPath = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+    if (-Not (Test-Path "Registry::$regPath")) {
+        New-Item -Path "Registry::$regPath" -Force | Out-Null
+    }
+    $regSet = reg add $regPath /v "EnableMicrosoftUpdate" /t REG_DWORD /d 1 /f 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Log "[OK] Aggiornamenti per altri prodotti Microsoft abilitati (registro)."
+        $script:tweaks["Aggiornamenti altri prodotti Microsoft"] = "[OK]"
+    } else {
+        Write-Log "[ERRORE] Impossibile abilitare aggiornamenti Microsoft. Codice: $LASTEXITCODE"
+        $script:tweaks["Aggiornamenti altri prodotti Microsoft"] = "[KO]"
+    }
 }
 
-# Imposta il valore nel Registro di sistema
-$regSet = reg add $regPath /v $regName /t REG_DWORD /d 1 /f 2>&1
-
-# Verifica il risultato con $LASTEXITCODE
+# === Sezione 5b: Abilitare "Avvisami quando e' necessario un riavvio per completare l'aggiornamento" ===
+Write-Log "`n=== Attivazione notifica riavvio necessario ==="
+reg add "HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" /v RestartNotificationsAllowed2 /t REG_DWORD /d 1 /f 2>&1 | Out-Null
 if ($LASTEXITCODE -eq 0) {
-    Write-Output "[OK] Impostazione completata con successo."
+    Write-Log "[OK] Notifica riavvio necessario abilitata (HKLM)."
+    # Imposta anche per l'utente corrente
+    $hkcuPath = "HKCU:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
+    if (-Not (Test-Path $hkcuPath)) { New-Item -Path $hkcuPath -Force | Out-Null }
+    Set-ItemProperty -Path $hkcuPath -Name "RestartNotificationsAllowed2" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    Write-Log "[OK] Notifica riavvio necessario abilitata (HKCU)."
 } else {
-    Write-Output "[ERRORE] Errore durante la modifica del registro. Codice: $LASTEXITCODE"
-    Write-Output "Dettagli errore: $regSet"
+    Write-Log "[ERRORE] Errore durante l'abilitazione della notifica di riavvio. Codice: $LASTEXITCODE"
 }
 
 # === Sezione 6: Modifica del motore di ricerca di Edge ===
@@ -519,11 +725,14 @@ if (Test-Path $preferencesPath) {
         $json | ConvertTo-Json -Depth 10 | Set-Content -Path $preferencesPath -Force -Encoding UTF8
 
         Write-Log "[OK] Motore di ricerca di Edge modificato con successo in Google."
+        $script:tweaks["Motore ricerca Edge -> Google"] = "[OK]"
     } catch {
         Write-Log "[ERRORE] Errore durante la modifica del motore di ricerca Edge: $_"
+        $script:tweaks["Motore ricerca Edge -> Google"] = "[KO]"
     }
 } else {
     Write-Log "[ATTENZIONE] Avviso: il file delle preferenze di Edge non esiste (Edge non è stato ancora eseguito)."
+    $script:tweaks["Motore ricerca Edge -> Google"] = "[--] Edge non ancora avviato"
 }
 
 # === Sezione 7: Modifica impostazione Visualizza estensioni file ===
@@ -542,8 +751,10 @@ try {
     Start-Sleep -Milliseconds 500
     Start-Process explorer
     Write-Log "[OK] Explorer riavviato con successo."
+    $script:tweaks["Estensioni file visibili"] = "[OK]"
 } catch {
     Write-Log "[ERRORE] Errore durante la modifica delle estensioni file: $_"
+    $script:tweaks["Estensioni file visibili"] = "[KO]"
 }
 
 # === Sezione 8: Impostazioni di risparmio energetico ===
@@ -554,15 +765,50 @@ Try {
     powercfg /change standby-timeout-ac 0
     powercfg /change standby-timeout-dc 0
     Write-Log "Impostazioni di risparmio energetico configurate su 'Mai' con successo."
+    $script:tweaks["Risparmio energetico -> Mai"] = "[OK]"
     Write-Host "`n"
 } Catch {
     Write-Log "[ERRORE] Errore durante la configurazione delle impostazioni di risparmio energetico: $_"
+    $script:tweaks["Risparmio energetico -> Mai"] = "[KO]"
     Write-Host "`n"
 }
+# === Sezione 8b: Imposta PowerShell 7 come profilo default in Windows Terminal ===
+Write-Log "`n=== Impostazione PowerShell 7 come profilo default di Windows Terminal ==="
+try {
+    $wtSettingsPath = "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
+    if (-not (Test-Path $wtSettingsPath)) {
+        Write-Log "[ATTENZIONE] Windows Terminal non trovato o non ancora avviato. Impostazione saltata."
+        $script:tweaks["Windows Terminal: default PS7"] = "[--] Terminal non trovato"
+    } else {
+        $wtSettings = Get-Content $wtSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        # Cerca il profilo PowerShell 7 tramite source (robusto, non dipende dal GUID)
+        $ps7Profile = $wtSettings.profiles.list | Where-Object {
+            $_.source -like "*PowershellCore*" -or $_.source -like "*PowerShell*"
+        } | Select-Object -First 1
+
+        if ($null -eq $ps7Profile) {
+            Write-Log "[ATTENZIONE] Profilo PowerShell 7 non trovato in Windows Terminal."
+            $script:tweaks["Windows Terminal: default PS7"] = "[--] Profilo PS7 non trovato"
+        } elseif ($wtSettings.defaultProfile -eq $ps7Profile.guid) {
+            Write-Log "PowerShell 7 e' gia' il profilo default di Windows Terminal."
+            $script:tweaks["Windows Terminal: default PS7"] = "[--] Gia' impostato"
+        } else {
+            $wtSettings.defaultProfile = $ps7Profile.guid
+            $wtSettings | ConvertTo-Json -Depth 20 | Set-Content $wtSettingsPath -Encoding UTF8 -Force
+            Write-Log "[OK] PowerShell 7 ($($ps7Profile.guid)) impostato come profilo default di Windows Terminal."
+            $script:tweaks["Windows Terminal: default PS7"] = "[OK]"
+        }
+    }
+} catch {
+    Write-Log "[ERRORE] Errore durante la configurazione di Windows Terminal: $_"
+    $script:tweaks["Windows Terminal: default PS7"] = "[KO]"
+}
+Write-Host "`n"
+
 Write-StateFile @{ Action = "Progress"; Step = "TweaksApplied" }
 
 # === Sezione 9: Avvio manuale di Windows Update ===
-if (Should-RunStep "WindowsUpdate") {
+if (Test-StepNeeded "WindowsUpdate") {
     # Cerca gli aggiornamenti disponibili
     Write-Log "Ricerca degli aggiornamenti disponibili..."
     try {
@@ -571,8 +817,19 @@ if (Should-RunStep "WindowsUpdate") {
         if ($updates) {
             Write-Log "Trovati $(($updates | Measure-Object).Count) aggiornamenti. Avvio installazione..."
 
-            # Installa gli aggiornamenti e registra l'output nel log
-            Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot | Out-File -Append -FilePath $logPath
+            $updateResults = Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot
+            $updateResults | ForEach-Object {
+                $kb    = if ($_.KB)     { " KB$($_.KB)" } else { "" }
+                $size  = if ($_.Size)   { " ($($_.Size))" } else { "" }
+                Write-Log ("  [{0}]{1}{2} {3}" -f $_.Result, $kb, $size, $_.Title)
+            }
+            # Traccia risultati per riepilogo
+            $script:wuCount = ($updateResults | Measure-Object).Count
+            foreach ($u in $updateResults) {
+                $kb   = if ($u.KB)   { "KB$($u.KB) - " } else { "" }
+                $size = if ($u.Size) { " ($($u.Size))" } else { "" }
+                $null = $script:wuResults.Add("[$($u.Result)] ${kb}$($u.Title)${size}")
+            }
 
             Write-Log "Installazione aggiornamenti completata."
             Write-Host "`n"
@@ -593,7 +850,7 @@ if (Should-RunStep "WindowsUpdate") {
 # === Sezione 10: Join al dominio ===
 $answer = Read-Host "Vuoi inserire il pc a dominio? (y/n)"
 if ($answer -ne 'y') {
-    Write-Log "Join al dominio annullato dall'utente."
+    Write-Log "[INFO] Join al dominio annullato dall'utente."
 } else {
     $currentPCName = $env:COMPUTERNAME
     Write-Host "`nNome PC attuale: $currentPCName"
@@ -618,8 +875,11 @@ if ($answer -ne 'y') {
         try {
             Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
             Register-ResumeTask
-            Start-Sleep -Seconds 5
+            Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
+            Start-Sleep -Seconds 3
             Restart-Computer -Force
+            Start-Sleep -Seconds 120
+            exit
         } catch {
             Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
         }
@@ -638,18 +898,33 @@ if ($answer -ne 'y') {
             exit 1
         }
         Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
-        Write-Log "Riavvio in corso per rendere operativo il join..."
-        Start-Sleep -Seconds 5
+        Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
+        Start-Sleep -Seconds 3
         Restart-Computer -Force
+        Start-Sleep -Seconds 120
+        exit
     }
 }
 
 # Controlla se e' necessario un riavvio per eseguire gli aggiornamenti di Windows Update
+# Nota: $updates e' valorizzato solo se la sezione WindowsUpdate ha girato in questa sessione
+#       e ha trovato aggiornamenti. Se $updates e' null, nessun aggiornamento e' stato installato.
+$updatesInstalledThisSession = $null -ne $updates -and ($updates | Measure-Object).Count -gt 0
 try {
-    if (Get-WURebootStatus) {
-        Write-Log "Riavvio richiesto per completare gli aggiornamenti. Il sistema si riavviera' tra 1 minuto..."
-        Start-Sleep -Seconds 60
+    $wuRebootRequired = Get-WURebootStatus
+    if ($wuRebootRequired -and $updatesInstalledThisSession) {
+        Write-Log "Riavvio richiesto per completare gli aggiornamenti."
+        Write-Summary
+        Write-StateFile @{ Action = "ShowSummary"; SummaryFile = $script:summaryFilePath }
+        Register-ResumeTask
+        Write-Log "*****************Script completato con successo. Sistema in riavvio per aggiornamenti.*****************"
+        Start-Sleep -Seconds 3
         Restart-Computer -Force
+        Start-Sleep -Seconds 120
+        exit
+    } elseif ($wuRebootRequired) {
+        Write-Log "[INFO] WURebootStatus segnala riavvio pendente, ma nessun aggiornamento installato in questa sessione: riavvio automatico saltato."
+        Write-Host "`n"
     } else {
         Write-Log "[OK] Riavvio non necessario."
         Write-Host "`n"
@@ -662,4 +937,5 @@ try {
 # === Chiusura dello Script ===
 if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
 Unregister-ResumeTask
+Write-Summary -OpenFile
 Write-Log "`n*****************Script completato con successo.*****************"

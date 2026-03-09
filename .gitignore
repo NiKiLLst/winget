@@ -1,0 +1,4 @@
+# Ignora file di log e stato generati localmente
+logs/
+# Ignora il file di savepoint per join a dominio
+logs/JoinDomainState.txt
