@@ -18,8 +18,105 @@ if (-not $isAdmin) {
     Write-Host "[OK] Script eseguito con privilegi amministrativi."
 }
 
+$scriptPath = $MyInvocation.MyCommand.Path
+
+function Ensure-GitPrerequisiteForAutoUpdate {
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    Write-Host ""
+    $answer = Read-Host "Git non trovato. Vuoi installare Git come pre-requisito di auto-update di questo script? (S/N)"
+    if ($answer -notmatch '^[sSyY]$') {
+        Write-Host "[INFO] Git non installato: auto-update disabilitato per questa esecuzione."
+        return
+    }
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "[ATTENZIONE] WinGet non disponibile: impossibile installare Git automaticamente."
+        return
+    }
+
+    try {
+        Write-Host "[INFO] Installazione Git in corso..."
+        & winget install -e --id "Git.Git" --source winget --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (Get-Command git -ErrorAction SilentlyContinue)) {
+            Write-Host "[OK] Git installato correttamente."
+        } else {
+            Write-Host "[ATTENZIONE] Installazione Git non completata (codice: $LASTEXITCODE)."
+        }
+    } catch {
+        Write-Host "[ATTENZIONE] Errore durante installazione Git: $_"
+    }
+}
+
+function Ensure-LatestScriptFromGitHub {
+    param(
+        [string]$repoPath,
+        [string]$scriptToRun
+    )
+
+    # Evita loop nel caso di rilancio successivo a un aggiornamento riuscito.
+    if ($env:WINGET_SELFUPDATED -eq "1") {
+        return
+    }
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Host "[INFO] Git non disponibile: skip controllo aggiornamenti da GitHub."
+        return
+    }
+
+    if (-not (Test-Path (Join-Path $repoPath ".git"))) {
+        Write-Host "[INFO] Repository git non trovato in $($repoPath): skip auto-update."
+        return
+    }
+
+    try {
+        $branch = (& git -C $repoPath rev-parse --abbrev-ref HEAD 2>$null).Trim()
+        if ([string]::IsNullOrWhiteSpace($branch) -or $branch -eq "HEAD") {
+            $branch = "main"
+        }
+
+        & git -C $repoPath fetch origin $branch --prune 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ATTENZIONE] Impossibile contattare GitHub per il controllo aggiornamenti."
+            return
+        }
+
+        $localHash = (& git -C $repoPath rev-parse HEAD 2>$null).Trim()
+        $remoteHash = (& git -C $repoPath rev-parse ("origin/{0}" -f $branch) 2>$null).Trim()
+
+        if ($localHash -eq $remoteHash) {
+            Write-Host "[OK] Script gia' all'ultima versione GitHub (origin/$branch)."
+            return
+        }
+
+        Write-Host "[INFO] Nuova versione trovata su GitHub (origin/$branch). Aggiornamento in corso..."
+        & git -C $repoPath pull --ff-only origin $branch 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ATTENZIONE] Aggiornamento automatico non riuscito (forse modifiche locali). Continuo con la versione corrente."
+            return
+        }
+
+        Write-Host "[OK] Script aggiornato da GitHub. Riavvio automatico..."
+        $env:WINGET_SELFUPDATED = "1"
+        Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptToRun`""
+        exit
+    } catch {
+        Write-Host "[ATTENZIONE] Errore durante auto-update da GitHub: $_"
+    }
+}
+
+# Chiede se installare Git quando manca, per abilitare l'auto-update da GitHub.
+Ensure-GitPrerequisiteForAutoUpdate
+
+# Tenta sempre il sync con GitHub prima di proseguire con il provisioning.
+Ensure-LatestScriptFromGitHub -repoPath $PSScriptRoot -scriptToRun $scriptPath
+
 # Percorso del file di stato per join al dominio (fisso, relativo allo script)
 $stateFile = "$PSScriptRoot\logs\JoinDomainState.txt"
+$planFile = "$PSScriptRoot\logs\ExecutionPlan.json"
+$domainCredentialFile = "$PSScriptRoot\logs\DomainJoinCredential.xml"
 
 # === Configurazione percorso log ===
 $configFile = "$PSScriptRoot\winget-config.json"
@@ -50,7 +147,7 @@ function Resolve-LogPath {
 $defaultLogPath = Resolve-LogPath $defaultLogPath
 
 # In modalita' resume automatico (savepoint presente) non chiedere: usa il default salvato
-$_stateExists = (Test-Path $stateFile) -and ((Get-Content $stateFile -Raw -ErrorAction SilentlyContinue) -match '"Action"\s*:\s*"(?:RenameOnly|JoinDomain|ShowSummary)"')
+$_stateExists = (Test-Path $stateFile) -and ((Get-Content $stateFile -Raw -ErrorAction SilentlyContinue) -match '"Action"\s*:\s*"(?:RenameOnly|JoinDomain|ShowSummary|Progress)"')
 if ($_stateExists) {
     $logPath = $defaultLogPath
 } else {
@@ -74,7 +171,7 @@ if ($_stateExists) {
 $domain = "test.local"  
 
 # Lista delle applicazioni da installare/aggiornare
-$apps = @(
+$availableApps = @(
     #"Se Non vuoi installare qualcosa, basta che ci metti un # davanti"
     "Microsoft.Edge",
     "Microsoft.Office",
@@ -92,6 +189,10 @@ $apps = @(
     "Git.Git",
     "FlipperDevicesInc.qFlipper"
 )
+
+$apps = @()
+$joinRequested = $false
+$desiredComputerName = $env:COMPUTERNAME
 
 # Pacchetti alternativi da provare se l'installazione principale fallisce (es. variante locale)
 $appFallbacks = @{
@@ -176,7 +277,7 @@ function Install-Or-Update-WinGetPackage {
     Write-Log "Verifica dello stato del pacchetto: $packageId"
 
     try {
-        $listOutput = & winget list --id $packageId --exact --accept-source-agreements 2>&1
+        $listOutput = & winget list -e --id "$packageId" --source winget --accept-source-agreements 2>&1
         $matchLine  = $listOutput | Where-Object { $_ -match [regex]::Escape($packageId) } | Select-Object -First 1
         $isInstalled = ($null -ne $matchLine)
 
@@ -186,7 +287,7 @@ function Install-Or-Update-WinGetPackage {
             Write-Log "Il pacchetto $packageId e' gia' installato (Versione: $currentVersion)."
 
             Write-Log "Verifica disponibilita' aggiornamento per $packageId..."
-            $upgradeOutput = & winget upgrade --id $packageId --exact --accept-source-agreements --accept-package-agreements 2>&1
+            $upgradeOutput = & winget upgrade -e --id "$packageId" --source winget --accept-source-agreements --accept-package-agreements 2>&1
             $upgradeText   = $upgradeOutput -join "`n"
 
             if ($LASTEXITCODE -ne 0) {
@@ -206,7 +307,7 @@ function Install-Or-Update-WinGetPackage {
             }
         } else {
             Write-Log "Il pacchetto $packageId non e' installato. Avvio installazione..."
-            & winget install --id $packageId --exact --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            & winget install -e --id "$packageId" --source winget --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
 
             if ($LASTEXITCODE -eq 0) {
                 Write-Log "[OK] Installazione completata con successo per $packageId"
@@ -217,7 +318,7 @@ function Install-Or-Update-WinGetPackage {
                 if ($script:appFallbacks -and $script:appFallbacks.ContainsKey($packageId)) {
                     $fallbackId = $script:appFallbacks[$packageId]
                     Write-Log "[INFO] Tentativo con pacchetto alternativo: $fallbackId"
-                    & winget install --id $fallbackId --exact --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                    & winget install -e --id "$fallbackId" --source winget --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                     if ($LASTEXITCODE -eq 0) {
                         Write-Log "[OK] Installazione completata con successo per $fallbackId (alternativo)"
                         $null = $script:appResults.Add(@{ Id = $packageId; Status = "Installato"; Note = "via $fallbackId" })
@@ -343,6 +444,71 @@ function Read-StateFile {
     return $null
 }
 
+function Write-ExecutionPlan {
+    param ([hashtable]$plan)
+    try {
+        $plan | ConvertTo-Json -Depth 6 | Out-File -FilePath $planFile -Force -Encoding UTF8
+    } catch {
+        Write-Log "[ERRORE] Impossibile scrivere il piano di esecuzione: $_"
+    }
+}
+
+function Read-ExecutionPlan {
+    try {
+        if (Test-Path $planFile) {
+            $content = Get-Content $planFile -Raw -Encoding UTF8
+            if ($content -match '\S') {
+                return $content | ConvertFrom-Json
+            }
+        }
+    } catch {
+        Write-Log "[ATTENZIONE] Piano di esecuzione non leggibile: $_"
+    }
+    return $null
+}
+
+function Select-AppsForInstallation {
+    param ([string[]]$candidateApps)
+
+    $selected = [System.Collections.ArrayList]::new()
+    Write-Host ""
+    Write-Host "Selezione applicazioni (Invio/S/Y = installa, N = salta)"
+    foreach ($candidate in $candidateApps) {
+        $answer = Read-Host "Vuoi installare '$candidate'? (S/N, Invio=S)"
+        if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^[sSyY]$') {
+            $null = $selected.Add($candidate)
+            Write-Host "  -> Aggiunta: $candidate"
+        } elseif ($answer -match '^[nN]$') {
+            Write-Host "  -> Esclusa:  $candidate"
+        } else {
+            $null = $selected.Add($candidate)
+            Write-Host "  -> Input non riconosciuto, aggiunta di default: $candidate"
+        }
+    }
+
+    return @($selected)
+}
+
+function Get-JoinCredentialFromPlan {
+    param($plan)
+
+    if ($plan -and $plan.DomainCredentialFile -and (Test-Path $plan.DomainCredentialFile)) {
+        try {
+            return Import-Clixml -Path $plan.DomainCredentialFile
+        } catch {
+            Write-Log "[ATTENZIONE] Impossibile leggere le credenziali salvate per il join dominio: $_"
+        }
+    }
+    return $null
+}
+
+function Confirm-Choice {
+    param([string]$message)
+
+    $confirm = Read-Host $message
+    return [string]::IsNullOrWhiteSpace($confirm) -or ($confirm -match '^[sSyY]$')
+}
+
 # === X.7 - Variabili di tracking e funzione di riepilogo ===
 $script:appResults      = [System.Collections.ArrayList]::new()
 $script:wuResults       = [System.Collections.ArrayList]::new()
@@ -442,49 +608,79 @@ try {
     exit 1
 }
 
-# Richiesta creazione utenti locali
-New-LocalAdminUser
-Write-Host "`n"
+# Carica eventuale stato precedente e piano esecuzione.
+$resumeState = Read-StateFile
+$executionPlan = Read-ExecutionPlan
+if ($null -eq $executionPlan) { $executionPlan = [ordered]@{} }
 
-# === Sezione Iniziale: Rinomina PC ===
-Write-Log "`n=== Rinomina PC ==="
-$currentPCName = $env:COMPUTERNAME
-Write-Host "Nome PC attuale: $currentPCName"
-$newPCName = Read-Host "Inserisci il nuovo nome PC (lascia vuoto per mantenere '$currentPCName')"
+if ($null -eq $resumeState) {
+    Write-Log "`n=== Raccolta input iniziale ==="
 
-if ([string]::IsNullOrWhiteSpace($newPCName)) {
-    $newPCName = $currentPCName
-}
+    # Tutte le domande utente vengono fatte in una fase unica iniziale.
+    New-LocalAdminUser
+    Write-Host "`n"
 
-if ($newPCName -ne $currentPCName) {
-    Write-Log "Rinomina PC: '$currentPCName' -> '$newPCName'"
-    Write-StateFile @{ Action = "RenameOnly"; Step = "Renamed"; DesiredComputerName = $newPCName }
-    try {
-        Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
-        Write-Log "[OK] PC rinominato. Registrazione task di resume e riavvio in corso..."
-        Register-ResumeTask
-        Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
-        Start-Sleep -Seconds 3
-        Restart-Computer -Force
-        Start-Sleep -Seconds 120  # Attendi l'interruzione da parte del SO
-        exit
-    } catch {
-        Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
+    $currentPCName = $env:COMPUTERNAME
+    Write-Host "Nome PC attuale: $currentPCName"
+    do {
+        $planPCName = Read-Host "Inserisci il nuovo nome PC (lascia vuoto per mantenere '$currentPCName')"
+        if ([string]::IsNullOrWhiteSpace($planPCName)) { $planPCName = $currentPCName }
+        $pcNameConfirmed = Confirm-Choice -message "Hai inserito '$planPCName' come nome PC, confermi? (Y/S o Invio)"
+        if (-not $pcNameConfirmed) {
+            Write-Host "  -> Reinserisci il nome PC."
+        }
+    } while (-not $pcNameConfirmed)
+
+    $joinAnswer = Read-Host "Vuoi inserire il PC a dominio? (y/n)"
+    $planJoin = $joinAnswer -match '^[yY]$'
+    $planDomain = $domain
+    if ($planJoin) {
+        Write-Host "Dominio attuale: $domain"
+        do {
+            $domainAnswer = Read-Host "Inserisci dominio (Invio per mantenere '$domain')"
+            if (-not [string]::IsNullOrWhiteSpace($domainAnswer)) { $planDomain = $domainAnswer }
+            $domainConfirmed = Confirm-Choice -message "Hai inserito '$planDomain' come dominio, confermi? (Y/S o Invio)"
+            if (-not $domainConfirmed) {
+                Write-Host "  -> Reinserisci il dominio."
+            }
+        } while (-not $domainConfirmed)
     }
-} else {
-    Write-Log "Nome PC invariato: '$currentPCName'. Nessun riavvio necessario."
-}
-Write-Host "`n"
 
-# Installato modulo Powershell Winget per loggare andamento installazione e update
-# Installato modulo PSWindowsUpdate per la gestione degli aggiornamenti di Windows
-# Controllo e installazione dei moduli solo se necessario
-Install-ModuleIfMissing "Microsoft.WinGet.Client"
-Install-ModuleIfMissing "PSWindowsUpdate"
-Write-Host "`n"
+    $selectedApps = Select-AppsForInstallation -candidateApps $availableApps
+
+    $executionPlan = [ordered]@{
+        DesiredComputerName = $planPCName
+        JoinDomain = $planJoin
+        Domain = $planDomain
+        Apps = @($selectedApps)
+        DomainCredentialFile = $null
+    }
+
+    if ($planJoin) {
+        $joinCred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $planDomain"
+        if ($null -eq $joinCred) {
+            Write-Log "[ERRORE] Credenziali non fornite. Annullamento esecuzione."
+            exit 1
+        }
+        try {
+            $joinCred | Export-Clixml -Path $domainCredentialFile -Force
+            $executionPlan.DomainCredentialFile = $domainCredentialFile
+            Write-Log "[OK] Credenziali dominio salvate per la fase automatica di join."
+        } catch {
+            Write-Log "[ERRORE] Impossibile salvare le credenziali dominio: $_"
+            exit 1
+        }
+    }
+
+    Write-ExecutionPlan -plan $executionPlan
+}
+
+$desiredComputerName = if ($executionPlan.DesiredComputerName) { [string]$executionPlan.DesiredComputerName } else { $env:COMPUTERNAME }
+$joinRequested = [bool]$executionPlan.JoinDomain
+$domain = if ($executionPlan.Domain) { [string]$executionPlan.Domain } else { $domain }
+$apps = @($executionPlan.Apps)
 
 # === Sezione 0: Resume da savepoint (stateFile JSON) ===
-$resumeState = Read-StateFile
 if ($null -ne $resumeState) {
     Write-Log "=== Ripresa da savepoint: Action=$($resumeState.Action), Step=$($resumeState.Step) ==="
     Unregister-ResumeTask
@@ -493,35 +689,20 @@ if ($null -ne $resumeState) {
     if ($resumeState.Action -eq "RenameOnly") {
         Write-Log "[OK] Rinomina completata. Rimozione savepoint e proseguimento script normale."
         Remove-Item $stateFile -Force
-        # Prosegue con il resto dello script (nessun exit)
     }
 
-    # --- Ripresa dopo rinomina pre-join: ora occorre fare il join ---
+    # --- Ripresa dopo rinomina pre-join: join automatico senza prompt ---
     elseif ($resumeState.Action -eq "JoinDomain" -and $resumeState.Step -eq "Renamed") {
         Write-Log "Ripresa join al dominio dopo rinomina."
         $currentPCName = $env:COMPUTERNAME
-
-        Write-Host "`nNome PC attuale: $currentPCName"
-        $confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
-        if ($confirmPCName -ne 'y') {
-            $newPCName = Read-Host "Inserisci il nuovo nome PC"
-        } else {
-            $newPCName = $currentPCName
-        }
-
         $savedDomain = if ($resumeState.Domain) { $resumeState.Domain } else { $domain }
-        Write-Host "`nDominio: $savedDomain"
-        $confirmDomain = Read-Host "Confermi il dominio? (y/n)"
-        if ($confirmDomain -ne 'y') {
-            $savedDomain = Read-Host "Inserisci il nuovo dominio"
-        }
         Write-Log "Dominio impostato: $savedDomain"
 
-        if ($newPCName -ne $currentPCName) {
-            Write-Log "Nome PC ancora diverso ('$currentPCName' -> '$newPCName'). Rinomina e riavvio."
-            Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $newPCName; Domain = $savedDomain }
+        if ($desiredComputerName -ne $currentPCName) {
+            Write-Log "Nome PC ancora diverso ('$currentPCName' -> '$desiredComputerName'). Rinomina e riavvio."
+            Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $savedDomain }
             try {
-                Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
+                Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
                 Register-ResumeTask
                 Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
                 Start-Sleep -Seconds 3
@@ -532,11 +713,11 @@ if ($null -ne $resumeState) {
                 Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
             }
         } else {
-            Write-Log "Procedo con il join al dominio '$savedDomain'."
+            Write-Log "Procedo con il join al dominio '$savedDomain' senza ulteriori prompt."
             try {
-                $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $savedDomain"
+                $cred = Get-JoinCredentialFromPlan -plan $executionPlan
                 if ($null -eq $cred) {
-                    Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+                    Write-Log "[ERRORE] Credenziali non disponibili nel piano. Annullamento join al dominio."
                     exit 1
                 }
                 Add-Computer -DomainName $savedDomain -Credential $cred -Force -ErrorAction Stop
@@ -547,6 +728,8 @@ if ($null -ne $resumeState) {
             }
             Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
             Remove-Item $stateFile -Force
+            if (Test-Path $planFile) { Remove-Item $planFile -Force }
+            if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
             Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
             Start-Sleep -Seconds 3
             Restart-Computer -Force
@@ -571,8 +754,7 @@ if ($null -ne $resumeState) {
     # --- Ripresa savepoint di progresso ---
     elseif ($resumeState.Action -eq "Progress") {
         Write-Log "Ripresa da savepoint progresso: Step=$($resumeState.Step)"
-        Unregister-ResumeTask  # pulizia di sicurezza
-        # stateFile mantenuto: verra' aggiornato man mano che le sezioni completano
+        Unregister-ResumeTask
     }
 
     # --- Stato sconosciuto: pulizia e proseguimento ---
@@ -581,6 +763,39 @@ if ($null -ne $resumeState) {
         Remove-Item $stateFile -Force
     }
 }
+
+# === Sezione Iniziale: Rinomina PC ===
+if ($null -eq $resumeState) {
+    Write-Log "`n=== Rinomina PC ==="
+    $currentPCName = $env:COMPUTERNAME
+    if ($desiredComputerName -ne $currentPCName) {
+        Write-Log "Rinomina PC: '$currentPCName' -> '$desiredComputerName'"
+        $renameAction = if ($joinRequested) { "JoinDomain" } else { "RenameOnly" }
+        Write-StateFile @{ Action = $renameAction; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $domain }
+        try {
+            Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
+            Write-Log "[OK] PC rinominato. Registrazione task di resume e riavvio in corso..."
+            Register-ResumeTask
+            Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
+            Start-Sleep -Seconds 3
+            Restart-Computer -Force
+            Start-Sleep -Seconds 120
+            exit
+        } catch {
+            Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
+        }
+    } else {
+        Write-Log "Nome PC invariato: '$currentPCName'. Nessun riavvio necessario."
+    }
+    Write-Host "`n"
+}
+
+# Installato modulo Powershell Winget per loggare andamento installazione e update
+# Installato modulo PSWindowsUpdate per la gestione degli aggiornamenti di Windows
+# Controllo e installazione dei moduli solo se necessario
+Install-ModuleIfMissing "Microsoft.WinGet.Client"
+Install-ModuleIfMissing "PSWindowsUpdate"
+Write-Host "`n"
 
 # === Savepoint: determina da dove riprendere ===
 $stepOrder = @("SysInfo", "AppsInstalled", "TweaksApplied", "WindowsUpdate")
@@ -623,10 +838,14 @@ if (Test-StepNeeded "AppsInstalled") {
     & winget source update 2>&1 | Out-Null
     Write-Log "[OK] Cataloghi winget aggiornati."
 
-    # Installazione o aggiornamento delle applicazioni necessarie
-    foreach ($app in $apps) {
-        Install-Or-Update-WinGetPackage -packageId $app
-        Write-Host "`n"
+    if ($apps.Count -eq 0) {
+        Write-Log "[INFO] Nessuna app selezionata dall'utente: sezione installazione saltata."
+    } else {
+        # Installazione o aggiornamento delle applicazioni selezionate in fase iniziale
+        foreach ($app in $apps) {
+            Install-Or-Update-WinGetPackage -packageId $app
+            Write-Host "`n"
+        }
     }
     Write-StateFile @{ Action = "Progress"; Step = "AppsInstalled" }
 } else {
@@ -848,32 +1067,17 @@ if (Test-StepNeeded "WindowsUpdate") {
 }
 
 # === Sezione 10: Join al dominio ===
-$answer = Read-Host "Vuoi inserire il pc a dominio? (y/n)"
-if ($answer -ne 'y') {
+if (-not $joinRequested) {
     Write-Log "[INFO] Join al dominio annullato dall'utente."
 } else {
     $currentPCName = $env:COMPUTERNAME
-    Write-Host "`nNome PC attuale: $currentPCName"
-    $confirmPCName = Read-Host "Confermi il nome PC? (y/n)"
-    if ($confirmPCName -ne 'y') {
-        $newPCName = Read-Host "Inserisci il nuovo nome PC"
-    } else {
-        $newPCName = $currentPCName
-    }
-    Write-Log "Nome PC impostato: $newPCName"
+    Write-Log "Dominio impostato da piano iniziale: $domain"
 
-    Write-Host "`nDominio attuale: $domain"
-    $confirmDomain = Read-Host "Confermi il dominio? (y/n)"
-    if ($confirmDomain -ne 'y') {
-        $domain = Read-Host "Inserisci il nuovo dominio"
-    }
-    Write-Log "Dominio impostato: $domain"
-
-    if ($newPCName -ne $currentPCName) {
-        Write-Log "Nome PC cambiato ('$currentPCName' -> '$newPCName'). Rinomina, salvataggio savepoint e riavvio."
-        Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $newPCName; Domain = $domain }
+    if ($desiredComputerName -ne $currentPCName) {
+        Write-Log "Nome PC cambiato ('$currentPCName' -> '$desiredComputerName'). Rinomina, salvataggio savepoint e riavvio."
+        Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $domain }
         try {
-            Rename-Computer -NewName $newPCName -Force -ErrorAction Stop
+            Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
             Register-ResumeTask
             Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
             Start-Sleep -Seconds 3
@@ -884,11 +1088,11 @@ if ($answer -ne 'y') {
             Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
         }
     } else {
-        Write-Log "Nome PC invariato. Procedo con il join al dominio '$domain'."
+        Write-Log "Nome PC invariato. Procedo con il join al dominio '$domain' senza ulteriori prompt."
         try {
-            $cred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $domain"
+            $cred = Get-JoinCredentialFromPlan -plan $executionPlan
             if ($null -eq $cred) {
-                Write-Log "[ERRORE] Credenziali non fornite. Annullamento join al dominio."
+                Write-Log "[ERRORE] Credenziali non disponibili nel piano. Annullamento join al dominio."
                 exit 1
             }
             Add-Computer -DomainName $domain -Credential $cred -Force -ErrorAction Stop
@@ -898,6 +1102,8 @@ if ($answer -ne 'y') {
             exit 1
         }
         Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
+        if (Test-Path $planFile) { Remove-Item $planFile -Force }
+        if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
         Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
         Start-Sleep -Seconds 3
         Restart-Computer -Force
@@ -936,6 +1142,9 @@ try {
 
 # === Chiusura dello Script ===
 if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
+if (Test-Path $planFile) { Remove-Item $planFile -Force }
+if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
 Unregister-ResumeTask
 Write-Summary -OpenFile
 Write-Log "`n*****************Script completato con successo.*****************"
+Write-Log "[PRONTO] PC pronto per l'utente."

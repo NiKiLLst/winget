@@ -1,303 +1,128 @@
 # Winget Automated Deployment Script - V6
 
-## Descrizione
+## Scopo
+Script PowerShell per provisioning workstation Windows in ambito aziendale: software standard, update, tweak di sistema, eventuale join dominio e report finale.
 
-Script PowerShell automatizzato per il provisioning e la configurazione di workstation Windows. Ideale per IT sistemisti che devono configurare rapidamente nuovi PC aziendali con software standard, aggiornamenti e impostazioni di sicurezza.
+Target: colleghi sistemisti (anche junior) che devono eseguire onboarding PC in modo ripetibile e tracciato.
 
-### Funzionalità Principali
+## Cosa fa
+- Auto-elevazione amministrativa se lanciato senza privilegi.
+- Controllo aggiornamento script da repository Git locale (con prompt per installare Git se manca).
+- Gestione log configurabile con persistenza in `winget-config.json`.
+- Raccolta input iniziale in un'unica fase (nome PC, dominio, app da installare, join).
+- Installazione/upgrade app via WinGet con fallback per Firefox locale.
+- Configurazioni OS e Windows Update.
+- Savepoint JSON + task schedulato per riprendere automaticamente dopo i riavvii.
+- Report finale (`Scheda_*.txt`) e messaggio di completamento.
 
-**1. Gestione Utenti Locali**
-- Creazione di utenti amministratori locali interattivi
-- Aggiunta automatica al gruppo Amministratori
-- Controllo di esistenza utente prima della creazione
+## Prerequisiti
+- Windows 10/11.
+- PowerShell 5.1+.
+- Esecuzione come amministratore (lo script si rilancia in autonomia).
+- WinGet disponibile in PATH.
+- Accesso rete se vuoi auto-update da GitHub e installazione pacchetti/moduli.
 
-**2. Installazione Software**
-- Installazione e aggiornamento automatico di applicazioni via WinGet
-- Lista configurabile di software (Edge, Office, VS Code, Git, ecc.)
-- Gestione fallback se modulo WinGet non disponibile
-
-**3. Gestione Aggiornamenti Windows**
-- Abilitazione aggiornamenti rapidi
-- Aggiornamenti facoltativi automatici
-- Aggiornamenti prodotti Microsoft aggiuntivi
-- Verifica stato riavvio e riavvio automatico se necessario
-
-**4. Configurazione Browser**
-- Modifica motore di ricerca Edge da Bing a Google
-- Gestione file preferenze Edge in JSON
-
-**5. Configurazione Sistema**
-- Visualizzazione estensioni file
-- Disabilitazione risparmio energetico (disco e standby)
-- Logging completo in `C:\Temp\LogsWinget.txt`
-
-**6. Rinomina PC all'avvio**
-- Prompt iniziale per scegliere un nuovo nome PC prima di qualsiasi installazione
-- Rinomina immediata con riavvio automatico
-- Task pianificato per riprendere lo script dopo il riavvio
-
-**7. Join Dominio Active Directory**
-- Join dominio con credenziali admin real-time
-- Rinomina PC opzionale prima del join
-- Task pianificato per riprendere dopo il riavvio
-- Promemoria spostamento OU
-
-## Guida per Sistemisti IT
-
-### Prerequisiti
-
-- **Windows 10/11** (Home, Pro, Enterprise)
-- **PowerShell 5.0+** (incluso di default)
-- **WinGet** (installato di default su Windows 11, disponibile da Microsoft Store su Windows 10)
-- **Privilegi Amministrativi** (almeno per installazioni moduli e modifiche registro)
-
-### Installazione
-
-1. Clonare o scaricare lo script:
-   ```powershell
-   git clone https://github.com/NiKiLLst/winget.git
-   cd script
-   ```
-
-2. Aprire PowerShell come Amministratore
-
-3. Eseguire lo script:
-   ```powershell
-   Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-   .\Winget.ps1
-   ```
-
-### Configurazione
-
-#### 1. Modifica Variabili Principali
-
-Nel file `Winget.ps1`, sezione all'inizio:
-
+## Avvio rapido
 ```powershell
-# Percorso del file di log (modificare se necessario)
-    $logpath = "$PSScriptRoot\logs\LogsWinget.txt"
-
-# Dominio per join (modificare con il vostro dominio)
-$domain = "tuodominio.local"
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+.\Winget.ps1
 ```
 
-#### 2. Personalizza Lista Software
+## Flusso operativo reale
+1. Verifica privilegi admin.
+2. Prompt opzionale installazione `Git.Git` se `git` non e' presente.
+3. Check aggiornamento script da repo Git locale (`fetch/pull`).
+4. Lettura/normalizzazione percorso log.
+5. Inizializzazione file runtime (`logs\...`).
+6. Verifica WinGet.
+7. Fase domande iniziale.
+8. Esecuzione step tecnici con savepoint.
+9. Eventuali riavvii e resume automatico.
+10. Report finale e cleanup stato/task.
 
-Modifica l'array `$apps` per includere solo il software necessario:
+## Domande iniziali (una sola fase)
+In assenza di resume, lo script chiede:
+- Creazione utente locale admin (opzionale).
+- Nuovo nome PC con conferma esplicita:
+    - esempio: `Hai inserito 'MARIO' come nome PC, confermi? (Y/S o Invio)`
+- Join dominio (`y/n`).
+- Dominio target (se join attivo) con conferma esplicita.
+- Selezione app una per una:
+    - `Invio`, `S`, `Y` = includi
+    - `N` = escludi
+- Credenziali dominio (solo se join attivo), salvate in XML locale per resume.
 
-```powershell
-$apps = @(
-    "Microsoft.Edge",
-    "Microsoft.Office",
-    "7zip.7zip",
-    "VideoLAN.VLC",
-    "Google.Chrome",
-    "Mozilla.Firefox",
-    "PuTTY.PuTTY",
-    "Microsoft.PowerShell",
-    "Microsoft.WindowsTerminal",
-    "Microsoft.VisualStudioCode",
-    "Git.Git",
-    "FlipperDevicesInc.qFlipper"
-)
-```
+## Savepoint e resume
+File runtime usati:
+- `logs\JoinDomainState.txt`
+- `logs\ExecutionPlan.json`
+- `logs\DomainJoinCredential.xml`
 
-**Nota**: Commenta le app non desiderate con `#` davanti:
-```powershell
-#"Adobe.Acrobat.Reader.64-bit"
-```
+Action principali nel savepoint:
+- `RenameOnly`
+- `JoinDomain`
+- `Progress`
+- `ShowSummary`
 
-### Esecuzione Interattiva
+Task schedulato usato per resume:
+- `WingetResumeTask`
 
-Lo script guida l'utente attraverso le seguenti decisioni:
+## Log e report
+- Log operativo: percorso scelto a runtime (default `logs\LogsWinget.txt`).
+- Config log persistente: `winget-config.json` (`LogPath`).
+- Report finale: `Scheda_<COMPUTERNAME>_<yyyy-MM-dd>.txt` nella stessa cartella del log.
 
-1. **Creazione Utente Locale**: Consente di creare uno o più utenti admin locali
-2. **Rinomina PC iniziale**: Propone il nome attuale e chiede se rinominare (subito, prima delle installazioni)
-3. **Nome PC per Join**: Al momento del join dominio, chiede nuovamente conferma/modifica del nome
-4. **Dominio**: Permette di confermare o modificare il dominio di destinazione
-5. **Join Dominio**: Chiede conferma e credenziali admin di dominio real-time
+## Software gestito
+Lista base nello script (`$availableApps`):
+- `Microsoft.Edge`
+- `Microsoft.Office`
+- `7zip.7zip`
+- `VideoLAN.VLC`
+- `Google.Chrome`
+- `Mozilla.Firefox` (fallback `Mozilla.Firefox.it`)
+- `PuTTY.PuTTY`
+- `Microsoft.PowerShell`
+- `Microsoft.WindowsTerminal`
+- `Microsoft.VisualStudioCode`
+- `Git.Git`
+- `FlipperDevicesInc.qFlipper`
 
-### Flusso di Esecuzione
+Comandi WinGet usati:
+- `winget list -e --id <ID> --source winget`
+- `winget upgrade -e --id <ID> --source winget`
+- `winget install -e --id <ID> --source winget`
 
-```
-┌─────────────────────────────────┐
-│ Verifica Privilegi Admin        │ (avviso se non admin)
-├─────────────────────────────────┤
-│ Inizializzazione File/Funzioni  │ (log, stateFile, helper functions)
-├─────────────────────────────────┤
-│ Creazione Utenti Locali         │ (opzionale)
-├─────────────────────────────────┤
-│ *** RINOMINA PC INIZIALE ***    │ propone nome attuale, chiede nuovo nome
-│                                 │ → se cambia: Rename + Task + Riavvio 1
-├─────────────────────────────────┤
-│ Installazione Moduli PowerShell │ (Microsoft.WinGet.Client, PSWindowsUpdate)
-├─────────────────────────────────┤
-│ Sezione 0: Resume da Savepoint  │ legge stateFile JSON:
-│ ├─ RenameOnly completata        │ → rimuove task, prosegue normalmente
-│ ├─ JoinDomain/Renamed           │ → chiede conferma, esegue join + Riavvio 2
-│ └─ Progress (step intermedio)   │ → riprende dall'ultimo step completato
-├─────────────────────────────────┤
-│ Sez.1 Raccolta Info Sistema     │ savepoint: SysInfo
-├─────────────────────────────────┤
-│ Sez.2 Installazione Applicazioni│ savepoint: AppsInstalled
-├─────────────────────────────────┤
-│ Sez.3-8 Tweaks Windows/Registry │ savepoint: TweaksApplied
-│  (Update settings, Edge, Ext,   │
-│   Risparmio Energetico)         │
-├─────────────────────────────────┤
-│ Sez.9 Windows Update            │ savepoint: WindowsUpdate
-├─────────────────────────────────┤
-│ Sez.10 Join Dominio             │ chiede conferma nome + dominio + credenziali
-│ ├─ Nome cambiato                │ → Rename + Task + Riavvio 2 (poi resume join)
-│ └─ Nome ok                     │ → Add-Computer + Riavvio 3
-├─────────────────────────────────┤
-│ Pulizia (stateFile + Task)      │
-└─────────────────────────────────┘
-```
+## Configurazioni applicate
+- Windows Update:
+    - aggiornamenti rapidi
+    - contenuti facoltativi
+    - Microsoft Update (COM/registro)
+    - notifica riavvio
+- Edge: motore ricerca default su Google (se file Preferences disponibile).
+- Explorer: estensioni file visibili.
+- Power settings: timeout su `Mai`.
+- Windows Terminal: profilo default PowerShell 7 (se `settings.json` disponibile).
 
-### Meccanismo Savepoint e Resume
+## Troubleshooting rapido
+- Errore WinGet non disponibile:
+    - installare/aggiornare App Installer.
+- Moduli non installabili:
+    - verificare connettivita, TLS/proxy, policy PSGallery.
+- Resume anomalo:
+    - controllare `logs\JoinDomainState.txt`.
+- Auto-update script non eseguito:
+    - verificare `git` disponibile e repository inizializzato (`.git`).
 
-A partire da V6 lo script salva lo stato di avanzamento in `logs\JoinDomainState.txt` (file relativo allo script: `$PSScriptRoot\logs\JoinDomainState.txt`) come JSON. In caso di interruzione imprevista o riavvio, alla prossima esecuzione lo script legge il savepoint e riprende dall'ultimo step completato.
+## Note operative per il team
+- Non committare file runtime/log (`logs/` e savepoint sono ignorati).
+- Prima di roll-out su produzione, test completo in VM.
+- Se personalizzi app/dominio, aggiorna questo README insieme al codice.
 
-**Struttura savepoint:**
-```json
-{ "Action": "Progress", "Step": "AppsInstalled" }
-```
+## Supporto
+In caso di problemi condividere:
+1. log completo (`LogsWinget.txt`)
+2. report finale (`Scheda_*.txt`)
+3. output errore PowerShell
 
-**Valori `Action` possibili:**
-
-| Action | Step | Significato |
-|---|---|---|
-| `Progress` | `SysInfo` / `AppsInstalled` / `TweaksApplied` / `WindowsUpdate` | Ripresa dall'ultimo step completato |
-| `RenameOnly` | `Renamed` | Riavvio post-rinomina iniziale: riprende normalmente |
-| `JoinDomain` | `Renamed` | Riavvio post-rinomina pre-join: riprende con il join |
-
-**Task pianificato:** `WingetResumeTask` — registrato prima di ogni riavvio; rimosso automaticamente alla ripresa.
-
-### Artefatti generati e archivio
-
-Durante lo sviluppo lo script e i comandi ausiliari possono generare file di debug e output (esempi creati nella workspace locale):
-
-- `milan-inter.html` — pagina di test locale per visualizzare stream (archiviata in `archive_v6.1_2026-03-09`).
-- `matches_today.json`, `v1_response.json` — dump delle risposte API (archiviati in `archive_v6.1_2026-03-09`).
-
-Per evitare di commettere file generati, è presente `.gitignore` che esclude la cartella `logs/` e il savepoint `logs/JoinDomainState.txt`.
-
-### Gestione Log
-
-Tutte le operazioni vengono registrate in:
-```
-C:\Temp\LogsWinget.txt
-```
-
-Formato log:
-```
-2025-12-08 10:24:55 - [OK] WinGet disponibile: v1.9.25200
-2025-12-08 10:25:03 - Modello: 20VD
-2025-12-08 10:25:03 - [OK] Installazione completata con successo per Microsoft.Edge
-```
-
-### Gestione Errori e Troubleshooting
-
-#### Errore: "Questo script dovrebbe essere eseguito con privilegi amministrativi"
-**Soluzione**: Aprire PowerShell come Amministratore (Esegui come amministratore)
-
-#### Errore: "WinGet non è installato o non è in PATH"
-**Soluzione**: 
-- Windows 11: Installare da Microsoft Store
-- Windows 10: https://github.com/microsoft/winget-cli/releases
-
-#### Errore: "Impossibile installare moduli in C:\Program Files\WindowsPowerShell\Modules"
-**Soluzione**: Eseguire come Amministratore o installare con `-Scope CurrentUser`
-
-#### Moduli Microsoft.WinGet.Client o PSWindowsUpdate non disponibili
-**Informazione**: Lo script continua automaticamente con fallback a CLI winget. Funzionalità ridotta ma comunque operativa.
-
-### Personalizzazione Avanzata
-
-#### Modifica Motore Ricerca Edge
-
-Modifica la sezione 6:
-```powershell
-$json.default_search_provider_data.template_url_data = @{
-    url = "https://www.google.com/search?q={searchTerms}"  # Cambiar URL qui
-}
-$json.default_search_provider_data.short_name = "Google"  # Nome qui
-```
-
-#### Aggiunta Software Aggiuntivo
-
-Aggiungi alla lista `$apps`:
-```powershell
-$apps = @(
-    # ... software esistente ...
-    "NuovoSoftware.ID"  # Nuovo software da installare
-)
-```
-
-Trova ID software disponibili con:
-```powershell
-winget search "nome software"
-```
-
-#### Disabilitare Sezioni Specifiche
-
-Commentare le sezioni nel codice principale:
-```powershell
-# Write-Log "Installazione aggiornamenti completata."  # Disabilita sezione aggiornamenti
-```
-
-### Best Practices
-
-1. **Test su VM**: Testare sempre su macchina virtuale prima di usare in produzione
-2. **Backup log**: Archiviare regolarmente i log in `C:\Temp\LogsWinget.txt`
-3. **Documenta Personalizzazioni**: Registrare modifiche fatte per poter replicare
-4. **Credenziali**: Non hardcodare credenziali nel file; usare Get-Credential
-5. **Riavvii**: I riavvii ora hanno un delay di 5 secondi (ridotto da 60s) con task pianificato per la ripresa automatica
-6. **Savepoint**: Lo script riprende automaticamente dall'ultimo step completato; rimuovere manualmente `C:\Temp\JoinDomainState.txt` solo se si vuole ripartire da zero
-
-### Storico Versioni
-
-**V6** (Marzo 2026)
-- Prompt iniziale per rinomina PC all'avvio dello script (prima delle installazioni)
-- Sistema savepoint JSON per ripresa automatica dopo interruzioni impreviste
-- Task pianificato (`WingetResumeTask`) su SYSTEM per rilancio automatico post-riavvio
-- Sezione 0 riscritta: gestisce `RenameOnly`, `JoinDomain/Renamed`, `Progress` (step intermedi)
-- Sezione 10 join dominio aggiornata: usa `Write-StateFile` e `Register-ResumeTask`
-- Delay riavvio ridotto da 60s a 5s (task pianificato garantisce la ripresa)
-- Funzioni helper: `Register-ResumeTask`, `Unregister-ResumeTask`, `Write-StateFile`, `Read-StateFile`, `Should-RunStep`
-
-**V5** (Dicembre 2025)
-- Aggiunto controllo privilegi admin con warning
-- Migliorate gestione errori e fallback
-- Aggiunto Try-Catch su tutte le operazioni critiche
-- Migliorato logging con gestione file
-- Rinominate funzioni con verbi PowerShell approvati
-- Documentazione estesa
-
-**V4**
-- Creazione utenti amministratori locali
-- Miglioramenti Try/Catch per regedit
-
-**V3**
-- Verifica runtime path JoinDomainState
-- Logging migliorato
-
-**V2**
-- Fix per join dominio
-
-**V1**
-- Versione iniziale
-
-### Supporto e Contributi
-
-Se riscontri problemi:
-1. Controlla il log in `C:\Temp\LogsWinget.txt`
-2. Esegui PowerShell come Amministratore
-3. Verifica i prerequisiti
-4. Apri una issue su GitHub
-
-### Licenza
-
-Script sviluppato per uso interno aziendale.
+Repository: `https://github.com/NiKiLLst/winget`
 

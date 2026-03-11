@@ -2,3 +2,5 @@
 logs/
 # Ignora il file di savepoint per join a dominio
 logs/JoinDomainState.txt
+# Ignora impostazioni locali di VS Code
+.vscode/
