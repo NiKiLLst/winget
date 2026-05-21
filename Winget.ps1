@@ -117,6 +117,10 @@ Ensure-LatestScriptFromGitHub -repoPath $PSScriptRoot -scriptToRun $scriptPath
 $stateFile = "$PSScriptRoot\logs\JoinDomainState.txt"
 $planFile = "$PSScriptRoot\logs\ExecutionPlan.json"
 $domainCredentialFile = "$PSScriptRoot\logs\DomainJoinCredential.xml"
+# Credenziali dell'utente di dominio finale (usate per autologon e provisioning post-join)
+$domainUserCredentialFile = "$PSScriptRoot\logs\DomainUserCredential.xml"
+# Chiave di registro usata per l'autologon temporaneo post-join
+$autologonRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
 
 # === Configurazione percorso log ===
 $configFile = "$PSScriptRoot\winget-config.json"
@@ -387,19 +391,22 @@ function New-LocalAdminUser {
 $resumeTaskName = "WingetResumeTask"
 
 function Register-ResumeTask {
+    # -User permette di registrare il task per un utente diverso da quello corrente
+    # (es. l'utente di dominio dopo il join, per riprendere il provisioning nel suo contesto).
+    param ([string]$User)
     Write-Log "Registrazione attivita' pianificata '$resumeTaskName' in corso..."
     try {
         $scriptPath  = $PSCommandPath
-        $currentUser = "$env:USERDOMAIN\$env:USERNAME"
+        $taskUser = if (-not [string]::IsNullOrWhiteSpace($User)) { $User } else { "$env:USERDOMAIN\$env:USERNAME" }
         $action   = New-ScheduledTaskAction -Execute "powershell.exe" `
                         -Argument "-WindowStyle Normal -ExecutionPolicy Bypass -File `"$scriptPath`""
-        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-        $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+        $principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Highest
         $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                         -ExecutionTimeLimit (New-TimeSpan -Hours 2)
         Register-ScheduledTask -TaskName $resumeTaskName -Action $action -Trigger $trigger `
             -Principal $principal -Settings $settings -Force | Out-Null
-        Write-Log "[OK] Attivita' pianificata '$resumeTaskName' registrata. Trigger: AtLogOn, Utente: $currentUser, Script: $scriptPath"
+        Write-Log "[OK] Attivita' pianificata '$resumeTaskName' registrata. Trigger: AtLogOn, Utente: $taskUser, Script: $scriptPath"
     } catch {
         Write-Log "[ERRORE] Impossibile registrare l'attivita' pianificata '$resumeTaskName': $_"
     }
@@ -489,24 +496,335 @@ function Select-AppsForInstallation {
     return @($selected)
 }
 
-function Get-JoinCredentialFromPlan {
-    param($plan)
-
-    if ($plan -and $plan.DomainCredentialFile -and (Test-Path $plan.DomainCredentialFile)) {
-        try {
-            return Import-Clixml -Path $plan.DomainCredentialFile
-        } catch {
-            Write-Log "[ATTENZIONE] Impossibile leggere le credenziali salvate per il join dominio: $_"
-        }
-    }
-    return $null
-}
-
 function Confirm-Choice {
     param([string]$message)
 
     $confirm = Read-Host $message
     return [string]::IsNullOrWhiteSpace($confirm) -or ($confirm -match '^[sSyY]$')
+}
+
+# === X.8 - Funzioni per join al dominio: verifica credenziali/nome, autologon ===
+
+# Verifica le credenziali contro il dominio.
+# Ritorna: $true valide, $false errate, $null dominio non raggiungibile.
+function Test-DomainCredential {
+    param (
+        [string]$domainName,
+        [System.Management.Automation.PSCredential]$credential
+    )
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.AccountManagement -ErrorAction Stop
+        $netCred = $credential.GetNetworkCredential()
+        $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext(
+            [System.DirectoryServices.AccountManagement.ContextType]::Domain, $domainName)
+        $valid = $ctx.ValidateCredentials($netCred.UserName, $netCred.Password)
+        $ctx.Dispose()
+        return [bool]$valid
+    } catch {
+        Write-Log "[ATTENZIONE] Impossibile contattare il dominio '$domainName' per la verifica credenziali: $_"
+        return $null
+    }
+}
+
+# Chiede le credenziali e le verifica sul dominio, in loop finche' valide.
+# Ritorna la PSCredential verificata, oppure $null se l'utente annulla.
+function Get-TestedDomainCredential {
+    param (
+        [string]$domainName,
+        [string]$promptMessage
+    )
+    while ($true) {
+        $cred = Get-Credential -Message $promptMessage
+        if ($null -eq $cred) { return $null }
+
+        $check = Test-DomainCredential -domainName $domainName -credential $cred
+        if ($check -eq $true) {
+            Write-Host "  -> Credenziali verificate sul dominio '$domainName'."
+            return $cred
+        } elseif ($null -eq $check) {
+            # Dominio non raggiungibile: non si puo' verificare, si lascia decidere all'operatore.
+            if (Confirm-Choice -message "Impossibile verificare le credenziali (dominio non raggiungibile). Proseguire comunque? (Y/S o Invio)") {
+                return $cred
+            }
+        } else {
+            Write-Host "  -> Credenziali errate per il dominio '$domainName'. Riprova."
+        }
+    }
+}
+
+# Legge una PSCredential da un file Clixml, se presente.
+function Import-CredentialFile {
+    param ([string]$path)
+    if ($path -and (Test-Path $path)) {
+        try {
+            return Import-Clixml -Path $path
+        } catch {
+            Write-Log "[ATTENZIONE] Impossibile leggere il file credenziali '$path': $_"
+        }
+    }
+    return $null
+}
+
+# Verifica se un nome PC e' gia' in uso.
+# Ritorna: 'Free', 'Exists' oppure 'Unknown' (verifica non riuscita).
+function Test-ComputerNameAvailable {
+    param (
+        [string]$computerName,
+        [bool]$joinDomain,
+        [string]$domainName,
+        [System.Management.Automation.PSCredential]$credential
+    )
+
+    if ($joinDomain -and $null -ne $credential) {
+        # Ricerca dell'oggetto computer in Active Directory
+        try {
+            $netCred = $credential.GetNetworkCredential()
+            $ldapUser = if ($netCred.Domain) { "$($netCred.Domain)\$($netCred.UserName)" } else { $netCred.UserName }
+            $entry    = New-Object System.DirectoryServices.DirectoryEntry(
+                "LDAP://$domainName", $ldapUser, $netCred.Password)
+            $searcher = New-Object System.DirectoryServices.DirectorySearcher($entry)
+            $searcher.Filter = "(&(objectCategory=computer)(cn=$computerName))"
+            $searcher.PageSize = 1
+            $result = $searcher.FindOne()
+            $searcher.Dispose()
+            $entry.Dispose()
+            if ($null -ne $result) { return 'Exists' } else { return 'Free' }
+        } catch {
+            Write-Log "[ATTENZIONE] Impossibile verificare il nome PC in Active Directory: $_"
+            return 'Unknown'
+        }
+    }
+
+    # Fallback senza dominio: ping ICMP
+    try {
+        if (Test-Connection -ComputerName $computerName -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+            return 'Exists'
+        }
+        return 'Free'
+    } catch {
+        return 'Unknown'
+    }
+}
+
+# Verifica se il PC e' gia' membro del dominio indicato.
+function Test-AlreadyJoinedToDomain {
+    param ([string]$domainName)
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if (-not $cs.PartOfDomain) { return $false }
+        if ([string]::IsNullOrWhiteSpace($domainName)) { return $true }
+        # Confronto tollerante: $cs.Domain puo' essere DNS o NetBIOS
+        $currentShort = ($cs.Domain  -split '\.')[0]
+        $wantShort    = ($domainName -split '\.')[0]
+        return ($cs.Domain -eq $domainName) -or ($currentShort -eq $wantShort)
+    } catch {
+        return $false
+    }
+}
+
+# Esegue il join al dominio; su errore propone di reinserire le credenziali e riprova.
+# Ritorna $true se il join e' riuscito, $false se rimandato.
+function Join-ComputerToDomain {
+    param (
+        [string]$domainName,
+        [System.Management.Automation.PSCredential]$credential,
+        [string]$credentialFile
+    )
+
+    $cred = $credential
+    while ($true) {
+        try {
+            Add-Computer -DomainName $domainName -Credential $cred -Force -ErrorAction Stop
+            Write-Log "[OK] PC aggiunto al dominio '$domainName' con successo."
+            return $true
+        } catch {
+            Write-Log "[ERRORE] Errore durante l'aggiunta al dominio '$domainName': $_"
+        }
+
+        $retry = Read-Host "Join al dominio fallito. Vuoi reinserire le credenziali e riprovare ora? (S/N)"
+        if ($retry -notmatch '^[sSyY]$') {
+            Write-Log "[INFO] Join rimandato. Lo script ripartira' dal join al prossimo accesso o rilancio."
+            return $false
+        }
+
+        $cred = Get-Credential -Message "Credenziali amministratore di dominio per $domainName"
+        if ($null -eq $cred) {
+            Write-Log "[INFO] Nessuna credenziale fornita. Join rimandato."
+            return $false
+        }
+        if ($credentialFile) {
+            try {
+                $cred | Export-Clixml -Path $credentialFile -Force
+                Write-Log "[OK] Credenziali dominio aggiornate per i tentativi successivi."
+            } catch {
+                Write-Log "[ATTENZIONE] Impossibile salvare le nuove credenziali dominio: $_"
+            }
+        }
+    }
+}
+
+# Aggiunge un account (es. utente di dominio) al gruppo Amministratori locali.
+function Add-DomainUserToLocalAdmins {
+    param ([string]$account)
+    try {
+        # SID S-1-5-32-544 = gruppo Administrators (robusto rispetto alla lingua del sistema)
+        $adminGroup = (Get-LocalGroup -SID "S-1-5-32-544" -ErrorAction Stop).Name
+        $shortName  = $account -replace '^.*\\', ''
+        $alreadyMember = Get-LocalGroupMember -Group $adminGroup -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ieq $account -or ($_.Name -replace '^.*\\', '') -ieq $shortName }
+        if ($alreadyMember) {
+            Write-Log "[INFO] L'utente '$account' e' gia' negli Amministratori locali."
+            return $true
+        }
+        Add-LocalGroupMember -Group $adminGroup -Member $account -ErrorAction Stop
+        Write-Log "[OK] Utente di dominio '$account' aggiunto agli Amministratori locali."
+        return $true
+    } catch {
+        Write-Log "[ERRORE] Impossibile aggiungere '$account' agli Amministratori locali: $_"
+        return $false
+    }
+}
+
+# Configura un autologon temporaneo per l'utente di dominio (con tetto AutoLogonCount).
+function Set-OneShotAutologon {
+    param (
+        [System.Management.Automation.PSCredential]$credential,
+        [string]$domainName
+    )
+    try {
+        $netCred    = $credential.GetNetworkCredential()
+        $userDomain = if ($netCred.Domain) { $netCred.Domain } else { $domainName }
+        Set-ItemProperty -Path $autologonRegPath -Name "AutoAdminLogon"    -Value "1"               -Type String -Force
+        Set-ItemProperty -Path $autologonRegPath -Name "DefaultUserName"   -Value $netCred.UserName -Type String -Force
+        Set-ItemProperty -Path $autologonRegPath -Name "DefaultDomainName" -Value $userDomain       -Type String -Force
+        Set-ItemProperty -Path $autologonRegPath -Name "DefaultPassword"   -Value $netCred.Password -Type String -Force
+        # Tetto di sicurezza: l'autologon si esaurisce da solo dopo alcuni accessi
+        Set-ItemProperty -Path $autologonRegPath -Name "AutoLogonCount"    -Value 5                 -Type DWord  -Force
+        Write-Log "[OK] Autologon temporaneo configurato per '$userDomain\$($netCred.UserName)'."
+        return $true
+    } catch {
+        Write-Log "[ERRORE] Impossibile configurare l'autologon: $_"
+        return $false
+    }
+}
+
+# Rimuove l'autologon temporaneo (in particolare la password in chiaro).
+function Clear-Autologon {
+    try {
+        foreach ($name in @("DefaultPassword", "AutoLogonCount")) {
+            $prop = Get-ItemProperty -Path $autologonRegPath -Name $name -ErrorAction SilentlyContinue
+            if ($null -ne $prop) {
+                Remove-ItemProperty -Path $autologonRegPath -Name $name -ErrorAction SilentlyContinue
+            }
+        }
+        Set-ItemProperty -Path $autologonRegPath -Name "AutoAdminLogon" -Value "0" -Type String -Force -ErrorAction SilentlyContinue
+        Write-Log "[OK] Autologon temporaneo rimosso."
+    } catch {
+        Write-Log "[ATTENZIONE] Impossibile rimuovere completamente l'autologon: $_"
+    }
+}
+
+# === X.9 - Orchestrazione della fase di join al dominio ===
+
+# Salva il savepoint Progress, registra il task di resume e riavvia: al prossimo
+# accesso il provisioning (sezioni 1-9) riprende da capo. Non ritorna mai.
+function Restart-ForProgressResume {
+    param ([string]$User)
+    Write-StateFile @{ Action = "Progress"; Step = "" }
+    if ([string]::IsNullOrWhiteSpace($User)) {
+        Register-ResumeTask
+    } else {
+        Register-ResumeTask -User $User
+    }
+    Write-Log "*****************Riavvio per eseguire il provisioning.*****************"
+    Start-Sleep -Seconds 3
+    Restart-Computer -Force
+    Start-Sleep -Seconds 120
+    exit
+}
+
+# Configurazione post-join: aggiunge l'utente di dominio agli Amministratori locali,
+# imposta l'autologon temporaneo e riavvia per eseguire il provisioning come quell'utente.
+# -allowRebootRetry: se l'aggiunta agli admin fallisce, riprova dopo un riavvio.
+# Non ritorna mai: riavvia il sistema e termina lo script.
+function Invoke-PostJoinSetup {
+    param (
+        [string]$domainName,
+        $plan,
+        [bool]$allowRebootRetry
+    )
+
+    $domainUser     = [string]$plan.DomainUserName
+    $domainUserCred = Import-CredentialFile -path $domainUserCredentialFile
+
+    # Senza utente di dominio valido il provisioning prosegue come utente corrente.
+    if ([string]::IsNullOrWhiteSpace($domainUser) -or $null -eq $domainUserCred) {
+        Write-Log "[ATTENZIONE] Utente di dominio non disponibile: il provisioning proseguira' come utente corrente."
+        Restart-ForProgressResume
+    }
+
+    if (-not (Add-DomainUserToLocalAdmins -account $domainUser)) {
+        if ($allowRebootRetry) {
+            Write-Log "[INFO] Aggiunta agli Amministratori locali non riuscita: verra' ritentata dopo il riavvio."
+            Write-StateFile @{ Action = "JoinDomain"; Step = "Joined"; DesiredComputerName = $env:COMPUTERNAME; Domain = $domainName }
+            Register-ResumeTask
+            Write-Log "*****************Sistema in riavvio per completare la configurazione del join.*****************"
+            Start-Sleep -Seconds 3
+            Restart-Computer -Force
+            Start-Sleep -Seconds 120
+            exit
+        }
+        Write-Log "[ATTENZIONE] Impossibile aggiungere l'utente di dominio agli Amministratori locali: provisioning come utente corrente."
+        Restart-ForProgressResume
+    }
+
+    # Autologon temporaneo: il provisioning ripartira' nel contesto dell'utente di dominio.
+    Set-OneShotAutologon -credential $domainUserCred -domainName $domainName | Out-Null
+    Write-Log "[OK] Configurazione post-join completata per '$domainUser'."
+    Restart-ForProgressResume -User $domainUser
+}
+
+# Esegue il join al dominio e, in caso di successo, la configurazione post-join.
+# Su errore mantiene savepoint e task di resume cosi' un rilancio riprende dal join.
+# Non ritorna mai: riavvia il sistema oppure termina lo script.
+function Invoke-DomainJoinPhase {
+    param (
+        [string]$domainName,
+        $plan
+    )
+
+    # Se il PC e' gia' a dominio (tentativo precedente riuscito) si passa al post-join.
+    if (Test-AlreadyJoinedToDomain -domainName $domainName) {
+        Write-Log "[OK] PC gia' membro del dominio '$domainName'. Proseguo con la configurazione post-join."
+        Write-StateFile @{ Action = "JoinDomain"; Step = "Joined"; DesiredComputerName = $env:COMPUTERNAME; Domain = $domainName }
+        Invoke-PostJoinSetup -domainName $domainName -plan $plan -allowRebootRetry $true
+        return
+    }
+
+    # Savepoint: pronti al join (nome PC gia' corretto). Mantenuto in caso di errore.
+    Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $env:COMPUTERNAME; Domain = $domainName }
+    Register-ResumeTask
+
+    $joinCred = Import-CredentialFile -path $domainCredentialFile
+    if ($null -eq $joinCred) {
+        Write-Log "[ATTENZIONE] Credenziali di join non disponibili: richiesta interattiva."
+        $joinCred = Get-Credential -Message "Credenziali di amministratore di dominio per $domainName"
+        if ($null -eq $joinCred) {
+            Write-Log "[INFO] Nessuna credenziale fornita. Join rimandato (savepoint e task mantenuti)."
+            exit
+        }
+        try { $joinCred | Export-Clixml -Path $domainCredentialFile -Force } catch {}
+    }
+
+    $joined = Join-ComputerToDomain -domainName $domainName -credential $joinCred -credentialFile $domainCredentialFile
+    if (-not $joined) {
+        Write-Log "[INFO] Join non completato. Savepoint e task mantenuti: lo script ripartira' dal join al prossimo avvio."
+        exit
+    }
+
+    Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
+    Write-StateFile @{ Action = "JoinDomain"; Step = "Joined"; DesiredComputerName = $env:COMPUTERNAME; Domain = $domainName }
+    Invoke-PostJoinSetup -domainName $domainName -plan $plan -allowRebootRetry $true
 }
 
 # === X.7 - Variabili di tracking e funzione di riepilogo ===
@@ -617,20 +935,12 @@ if ($null -eq $resumeState) {
     Write-Log "`n=== Raccolta input iniziale ==="
 
     # Tutte le domande utente vengono fatte in una fase unica iniziale.
+    # Ordine: il dominio e le credenziali servono per verificare il nome PC in AD,
+    # quindi vengono richiesti prima del nome PC.
     New-LocalAdminUser
     Write-Host "`n"
 
-    $currentPCName = $env:COMPUTERNAME
-    Write-Host "Nome PC attuale: $currentPCName"
-    do {
-        $planPCName = Read-Host "Inserisci il nuovo nome PC (lascia vuoto per mantenere '$currentPCName')"
-        if ([string]::IsNullOrWhiteSpace($planPCName)) { $planPCName = $currentPCName }
-        $pcNameConfirmed = Confirm-Choice -message "Hai inserito '$planPCName' come nome PC, confermi? (Y/S o Invio)"
-        if (-not $pcNameConfirmed) {
-            Write-Host "  -> Reinserisci il nome PC."
-        }
-    } while (-not $pcNameConfirmed)
-
+    # --- Join al dominio e dominio di destinazione ---
     $joinAnswer = Read-Host "Vuoi inserire il PC a dominio? (y/n)"
     $planJoin = $joinAnswer -match '^[yY]$'
     $planDomain = $domain
@@ -646,28 +956,100 @@ if ($null -eq $resumeState) {
         } while (-not $domainConfirmed)
     }
 
+    # --- Credenziali di dominio (verificate subito, prima di salvarle) ---
+    $joinCred       = $null
+    $domainUserCred = $null
+    $domainUserName = $null
+    if ($planJoin) {
+        # 1) Credenziali dell'amministratore che esegue il join al dominio
+        $joinCred = Get-TestedDomainCredential -domainName $planDomain `
+            -promptMessage "Credenziali di amministratore di dominio per il join a $planDomain"
+        if ($null -eq $joinCred) {
+            Write-Log "[ERRORE] Credenziali di join non fornite. Annullamento esecuzione."
+            exit 1
+        }
+
+        # 2) Credenziali dell'utente di dominio che utilizzera' il PC
+        Write-Host ""
+        Write-Host "[ATTENZIONE] L'utente di dominio finale verra' aggiunto al gruppo Amministratori"
+        Write-Host "             locali di questo PC: serve per eseguire app/tweak/Windows Update"
+        Write-Host "             dopo il join, nel contesto di quell'utente."
+        $domainUserCred = Get-TestedDomainCredential -domainName $planDomain `
+            -promptMessage "Credenziali dell'utente di dominio che utilizzera' il PC"
+        if ($null -eq $domainUserCred) {
+            Write-Log "[ERRORE] Credenziali utente di dominio non fornite. Annullamento esecuzione."
+            exit 1
+        }
+        # Normalizza il nome utente. Se gia' qualificato (DOMINIO\utente o utente@dominio)
+        # si mantiene; altrimenti si antepone il nome NetBIOS del dominio (forma piu'
+        # compatibile con Add-LocalGroupMember, task pianificato e autologon).
+        $rawDomainUser = $domainUserCred.UserName
+        if ($rawDomainUser -match '[\\@]') {
+            $domainUserName = $rawDomainUser
+        } else {
+            $netbiosDomain  = ($planDomain -split '\.')[0].ToUpper()
+            $domainUserName = "$netbiosDomain\$rawDomainUser"
+        }
+    }
+
+    # --- Nome PC (con verifica disponibilita') ---
+    $currentPCName = $env:COMPUTERNAME
+    Write-Host ""
+    Write-Host "Nome PC attuale: $currentPCName"
+    do {
+        $planPCName = Read-Host "Inserisci il nuovo nome PC (lascia vuoto per mantenere '$currentPCName')"
+        if ([string]::IsNullOrWhiteSpace($planPCName)) { $planPCName = $currentPCName }
+        if (-not (Confirm-Choice -message "Hai inserito '$planPCName' come nome PC, confermi? (Y/S o Invio)")) {
+            Write-Host "  -> Reinserisci il nome PC."
+            $pcNameAccepted = $false
+            continue
+        }
+        if ($planPCName -ieq $currentPCName) {
+            # Mantiene il nome attuale: nessun nome nuovo da verificare.
+            $pcNameAccepted = $true
+        } else {
+            $nameStatus = Test-ComputerNameAvailable -computerName $planPCName -joinDomain $planJoin `
+                -domainName $planDomain -credential $joinCred
+            if ($nameStatus -eq 'Exists') {
+                if (Confirm-Choice -message "Esiste gia' un pc con questo nome. Vuoi cambiare il nome? (Y/S o Invio)") {
+                    Write-Host "  -> Reinserisci il nome PC."
+                    $pcNameAccepted = $false
+                } else {
+                    $pcNameAccepted = $true
+                }
+            } elseif ($nameStatus -eq 'Free') {
+                Write-Host "  -> Non esiste attualmente un pc con questo nome."
+                $pcNameAccepted = $true
+            } else {
+                Write-Host "  -> Impossibile verificare il nome PC: si prosegue con '$planPCName'."
+                $pcNameAccepted = $true
+            }
+        }
+    } while (-not $pcNameAccepted)
+
+    # --- Selezione applicazioni ---
     $selectedApps = Select-AppsForInstallation -candidateApps $availableApps
 
+    # --- Salvataggio credenziali e piano di esecuzione ---
     $executionPlan = [ordered]@{
-        DesiredComputerName = $planPCName
-        JoinDomain = $planJoin
-        Domain = $planDomain
-        Apps = @($selectedApps)
-        DomainCredentialFile = $null
+        DesiredComputerName      = $planPCName
+        JoinDomain               = $planJoin
+        Domain                   = $planDomain
+        Apps                     = @($selectedApps)
+        DomainCredentialFile     = $null
+        DomainUserCredentialFile = $null
+        DomainUserName           = $domainUserName
     }
 
     if ($planJoin) {
-        $joinCred = Get-Credential -Message "Inserisci le credenziali di amministratore di dominio per $planDomain"
-        if ($null -eq $joinCred) {
-            Write-Log "[ERRORE] Credenziali non fornite. Annullamento esecuzione."
-            exit 1
-        }
         try {
-            $joinCred | Export-Clixml -Path $domainCredentialFile -Force
-            $executionPlan.DomainCredentialFile = $domainCredentialFile
-            Write-Log "[OK] Credenziali dominio salvate per la fase automatica di join."
+            $joinCred       | Export-Clixml -Path $domainCredentialFile -Force
+            $domainUserCred | Export-Clixml -Path $domainUserCredentialFile -Force
+            $executionPlan.DomainCredentialFile     = $domainCredentialFile
+            $executionPlan.DomainUserCredentialFile = $domainUserCredentialFile
+            Write-Log "[OK] Credenziali di dominio salvate per la fase automatica di join."
         } catch {
-            Write-Log "[ERRORE] Impossibile salvare le credenziali dominio: $_"
+            Write-Log "[ERRORE] Impossibile salvare le credenziali di dominio: $_"
             exit 1
         }
     }
@@ -679,6 +1061,10 @@ $desiredComputerName = if ($executionPlan.DesiredComputerName) { [string]$execut
 $joinRequested = [bool]$executionPlan.JoinDomain
 $domain = if ($executionPlan.Domain) { [string]$executionPlan.Domain } else { $domain }
 $apps = @($executionPlan.Apps)
+$domainUserName = if ($executionPlan.DomainUserName) { [string]$executionPlan.DomainUserName } else { $null }
+# Dominio di destinazione stabile: la Sezione 1 (SysInfo) sovrascrive $domain con il
+# dominio corrente del PC, quindi join e verifiche usano $plannedDomain.
+$plannedDomain = $domain
 
 # === Sezione 0: Resume da savepoint (stateFile JSON) ===
 if ($null -ne $resumeState) {
@@ -691,63 +1077,52 @@ if ($null -ne $resumeState) {
         Remove-Item $stateFile -Force
     }
 
-    # --- Ripresa dopo rinomina pre-join: join automatico senza prompt ---
-    elseif ($resumeState.Action -eq "JoinDomain" -and $resumeState.Step -eq "Renamed") {
-        Write-Log "Ripresa join al dominio dopo rinomina."
+    # --- Ripresa della fase di join al dominio ---
+    elseif ($resumeState.Action -eq "JoinDomain") {
         $currentPCName = $env:COMPUTERNAME
         $savedDomain = if ($resumeState.Domain) { $resumeState.Domain } else { $domain }
-        Write-Log "Dominio impostato: $savedDomain"
+        Write-Log "Ripresa fase di join al dominio '$savedDomain' (Step=$($resumeState.Step))."
 
-        if ($desiredComputerName -ne $currentPCName) {
-            Write-Log "Nome PC ancora diverso ('$currentPCName' -> '$desiredComputerName'). Rinomina e riavvio."
-            Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $savedDomain }
-            try {
-                Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
-                Register-ResumeTask
-                Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
-                Start-Sleep -Seconds 3
-                Restart-Computer -Force
-                Start-Sleep -Seconds 120
-                exit
-            } catch {
-                Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
-            }
+        if ($resumeState.Step -eq "Joined") {
+            # Join gia' eseguito: manca solo la configurazione post-join.
+            Invoke-PostJoinSetup -domainName $savedDomain -plan $executionPlan -allowRebootRetry $false
         } else {
-            Write-Log "Procedo con il join al dominio '$savedDomain' senza ulteriori prompt."
-            try {
-                $cred = Get-JoinCredentialFromPlan -plan $executionPlan
-                if ($null -eq $cred) {
-                    Write-Log "[ERRORE] Credenziali non disponibili nel piano. Annullamento join al dominio."
-                    exit 1
+            # Step "Renamed" (o sconosciuto): il nome PC deve essere corretto, poi join.
+            if ($desiredComputerName -ne $currentPCName) {
+                Write-Log "Nome PC ancora diverso ('$currentPCName' -> '$desiredComputerName'). Rinomina e riavvio."
+                Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $savedDomain }
+                try {
+                    Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
+                    Register-ResumeTask
+                    Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
+                    Start-Sleep -Seconds 3
+                    Restart-Computer -Force
+                    Start-Sleep -Seconds 120
+                    exit
+                } catch {
+                    Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
                 }
-                Add-Computer -DomainName $savedDomain -Credential $cred -Force -ErrorAction Stop
-                Write-Log "[OK] PC aggiunto al dominio con successo."
-            } catch {
-                Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
-                exit 1
             }
-            Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
-            Remove-Item $stateFile -Force
-            if (Test-Path $planFile) { Remove-Item $planFile -Force }
-            if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
-            Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
-            Start-Sleep -Seconds 3
-            Restart-Computer -Force
-            Start-Sleep -Seconds 120
-            exit
+            # Esegue join + configurazione post-join (la funzione riavvia o esce).
+            Invoke-DomainJoinPhase -domainName $savedDomain -plan $executionPlan
         }
     }
 
     # --- Riepilogo post-riavvio aggiornamenti ---
     elseif ($resumeState.Action -eq "ShowSummary") {
         Unregister-ResumeTask
-        Remove-Item $stateFile -Force
+        Clear-Autologon
         if ($resumeState.SummaryFile -and (Test-Path $resumeState.SummaryFile)) {
             Write-Log "[OK] Apertura scheda installazione: $($resumeState.SummaryFile)"
             Start-Process notepad.exe -ArgumentList "`"$($resumeState.SummaryFile)`""
         } else {
             Write-Log "[ATTENZIONE] File scheda non trovato: $($resumeState.SummaryFile)"
         }
+        # Stato terminale: pulizia finale dei file di stato e credenziali.
+        if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
+        if (Test-Path $planFile) { Remove-Item $planFile -Force }
+        if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
+        if (Test-Path $domainUserCredentialFile) { Remove-Item $domainUserCredentialFile -Force }
         exit
     }
 
@@ -788,6 +1163,16 @@ if ($null -eq $resumeState) {
         Write-Log "Nome PC invariato: '$currentPCName'. Nessun riavvio necessario."
     }
     Write-Host "`n"
+}
+
+# === Sezione Join al dominio (anticipata) ===
+# Il join viene eseguito come PRIMO passo, cosi' il provisioning (app/tweak/Windows
+# Update) gira poi nel contesto dell'utente di dominio. Questo blocco copre il caso
+# senza rinomina; con rinomina il join e' gestito dal ramo di resume dopo il riavvio.
+if ($joinRequested -and ($null -eq $resumeState) -and -not (Test-AlreadyJoinedToDomain -domainName $plannedDomain)) {
+    Write-Log "`n=== Join al dominio '$plannedDomain' ==="
+    # La funzione esegue join + configurazione post-join e poi riavvia (non ritorna).
+    Invoke-DomainJoinPhase -domainName $plannedDomain -plan $executionPlan
 }
 
 # Installato modulo Powershell Winget per loggare andamento installazione e update
@@ -1066,50 +1451,17 @@ if (Test-StepNeeded "WindowsUpdate") {
     Write-Log "[SKIP] Sezione 9 (WindowsUpdate) gia' completata."
 }
 
-# === Sezione 10: Join al dominio ===
+# === Sezione 10: Join al dominio (verifica) ===
+# Il join vero e' eseguito come primo passo (sezione anticipata o ramo di resume):
+# qui resta solo un controllo di sicurezza.
 if (-not $joinRequested) {
-    Write-Log "[INFO] Join al dominio annullato dall'utente."
+    Write-Log "[INFO] Join al dominio non richiesto."
+} elseif (Test-AlreadyJoinedToDomain -domainName $plannedDomain) {
+    Write-Log "[OK] PC gia' membro del dominio '$plannedDomain'."
 } else {
-    $currentPCName = $env:COMPUTERNAME
-    Write-Log "Dominio impostato da piano iniziale: $domain"
-
-    if ($desiredComputerName -ne $currentPCName) {
-        Write-Log "Nome PC cambiato ('$currentPCName' -> '$desiredComputerName'). Rinomina, salvataggio savepoint e riavvio."
-        Write-StateFile @{ Action = "JoinDomain"; Step = "Renamed"; DesiredComputerName = $desiredComputerName; Domain = $domain }
-        try {
-            Rename-Computer -NewName $desiredComputerName -Force -ErrorAction Stop
-            Register-ResumeTask
-            Write-Log "*****************Script in pausa. Sistema in riavvio per rinomina PC.*****************"
-            Start-Sleep -Seconds 3
-            Restart-Computer -Force
-            Start-Sleep -Seconds 120
-            exit
-        } catch {
-            Write-Log "[ERRORE] Impossibile rinominare il PC: $_"
-        }
-    } else {
-        Write-Log "Nome PC invariato. Procedo con il join al dominio '$domain' senza ulteriori prompt."
-        try {
-            $cred = Get-JoinCredentialFromPlan -plan $executionPlan
-            if ($null -eq $cred) {
-                Write-Log "[ERRORE] Credenziali non disponibili nel piano. Annullamento join al dominio."
-                exit 1
-            }
-            Add-Computer -DomainName $domain -Credential $cred -Force -ErrorAction Stop
-            Write-Log "[OK] PC aggiunto al dominio con successo."
-        } catch {
-            Write-Log "[ERRORE] Errore durante l'aggiunta al dominio: $_"
-            exit 1
-        }
-        Write-Log "[ATTENZIONE] RICORDATI DI SPOSTARE IL PC NELL'UNITA' ORGANIZZATIVA CORRETTA"
-        if (Test-Path $planFile) { Remove-Item $planFile -Force }
-        if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
-        Write-Log "*****************Script completato con successo. Sistema in riavvio per join al dominio.*****************"
-        Start-Sleep -Seconds 3
-        Restart-Computer -Force
-        Start-Sleep -Seconds 120
-        exit
-    }
+    Write-Log "[ATTENZIONE] Join al dominio '$plannedDomain' non ancora eseguito: esecuzione ora."
+    # La funzione esegue join + configurazione post-join e poi riavvia (non ritorna).
+    Invoke-DomainJoinPhase -domainName $plannedDomain -plan $executionPlan
 }
 
 # Controlla se e' necessario un riavvio per eseguire gli aggiornamenti di Windows Update
@@ -1141,9 +1493,11 @@ try {
 }
 
 # === Chiusura dello Script ===
+Clear-Autologon
 if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
 if (Test-Path $planFile) { Remove-Item $planFile -Force }
 if (Test-Path $domainCredentialFile) { Remove-Item $domainCredentialFile -Force }
+if (Test-Path $domainUserCredentialFile) { Remove-Item $domainUserCredentialFile -Force }
 Unregister-ResumeTask
 Write-Summary -OpenFile
 Write-Log "`n*****************Script completato con successo.*****************"

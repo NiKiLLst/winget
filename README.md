@@ -9,7 +9,9 @@ Target: colleghi sistemisti (anche junior) che devono eseguire onboarding PC in 
 - Auto-elevazione amministrativa se lanciato senza privilegi.
 - Controllo aggiornamento script da repository Git locale (con prompt per installare Git se manca).
 - Gestione log configurabile con persistenza in `winget-config.json`.
-- Raccolta input iniziale in un'unica fase (nome PC, dominio, app da installare, join).
+- Raccolta input iniziale in un'unica fase (dominio, credenziali, nome PC, app da installare, join).
+- Verifica delle credenziali di dominio prima di salvarle e verifica del nome PC inserito.
+- Quando richiesto, join al dominio come primo passo; il provisioning successivo gira nel contesto dell'utente di dominio (autologon temporaneo).
 - Installazione/upgrade app via WinGet con fallback per Firefox locale.
 - Configurazioni OS e Windows Update.
 - Savepoint JSON + task schedulato per riprendere automaticamente dopo i riavvii.
@@ -41,28 +43,44 @@ Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 10. Report finale e cleanup stato/task.
 
 ## Domande iniziali (una sola fase)
-In assenza di resume, lo script chiede:
+In assenza di resume, lo script chiede, in quest'ordine:
 - Creazione utente locale admin (opzionale).
-- Nuovo nome PC con conferma esplicita:
-    - esempio: `Hai inserito 'MARIO' come nome PC, confermi? (Y/S o Invio)`
 - Join dominio (`y/n`).
 - Dominio target (se join attivo) con conferma esplicita.
+- Credenziali dell'amministratore di dominio per il join (se join attivo): verificate
+  subito sul dominio, in loop finche' valide.
+- Credenziali dell'utente di dominio che usera' il PC (se join attivo): verificate sul
+  dominio. Avviso: questo utente verra' aggiunto agli Amministratori locali del PC.
+- Nuovo nome PC con conferma esplicita:
+    - esempio: `Hai inserito 'MARIO' come nome PC, confermi? (Y/S o Invio)`
+    - se il nome e' diverso da quello attuale viene verificata la disponibilita'
+      (ricerca in Active Directory se si joina, altrimenti ping ICMP):
+        - libero → `Non esiste attualmente un pc con questo nome`
+        - occupato → `Esiste gia' un pc con questo nome. Vuoi cambiare il nome?`
 - Selezione app una per una:
     - `Invio`, `S`, `Y` = includi
     - `N` = escludi
-- Credenziali dominio (solo se join attivo), salvate in XML locale per resume.
+
+Le credenziali (join attivo) vengono salvate in XML locale (cifrato DPAPI) per il resume.
 
 ## Savepoint e resume
 File runtime usati:
 - `logs\JoinDomainState.txt`
 - `logs\ExecutionPlan.json`
-- `logs\DomainJoinCredential.xml`
+- `logs\DomainJoinCredential.xml` (credenziali admin di join)
+- `logs\DomainUserCredential.xml` (credenziali utente di dominio finale)
 
 Action principali nel savepoint:
 - `RenameOnly`
-- `JoinDomain`
+- `JoinDomain` (sotto-stato `Step`: `Renamed` = pronto al join, `Joined` = join fatto,
+  manca la configurazione post-join)
 - `Progress`
 - `ShowSummary`
+
+Fase di join (quando richiesto): rinomina PC → join al dominio → aggiunta dell'utente di
+dominio agli Amministratori locali + autologon temporaneo → riavvio → provisioning
+(app/tweak/Windows Update) nel contesto dell'utente di dominio. Se il join si interrompe
+dopo un riavvio, al rilancio lo script riparte dallo step indicato dal savepoint.
 
 Task schedulato usato per resume:
 - `WingetResumeTask`
@@ -117,6 +135,10 @@ Comandi WinGet usati:
 - Non committare file runtime/log (`logs/` e savepoint sono ignorati).
 - Prima di roll-out su produzione, test completo in VM.
 - Se personalizzi app/dominio, aggiorna questo README insieme al codice.
+- Join al dominio: per il provisioning post-join lo script imposta un autologon
+  temporaneo dell'utente di dominio (password in chiaro nel registro `Winlogon`).
+  Viene rimosso automaticamente al termine; in caso di interruzione anomala verificare
+  che `AutoAdminLogon`/`DefaultPassword` siano stati ripuliti.
 
 ## Supporto
 In caso di problemi condividere:
