@@ -184,12 +184,13 @@ $availableApps = @(
     "VideoLAN.VLC",
     "Google.Chrome",
     "Mozilla.Firefox",
-    #"Amazon.AWSCLI"
+    #"Amazon.AWSCLI",
     "PuTTY.PuTTY",
-    #"Postman.Postman"
+    #"Postman.Postman",
     "Microsoft.PowerShell",
     "Microsoft.WindowsTerminal",
     "Microsoft.VisualStudioCode",
+    "Microsoft.AzureCLI",
     "Git.Git",
     "FlipperDevicesInc.qFlipper"
 )
@@ -423,6 +424,29 @@ function Unregister-ResumeTask {
         }
     } catch {
         Write-Log "[ERRORE] Impossibile rimuovere l'attivita' pianificata '$resumeTaskName': $_"
+    }
+}
+
+# Garantisce che il task di resume sia attivo durante TUTTA l'esecuzione, non solo
+# nei brevi istanti che precedono un Restart-Computer pianificato. In questo modo,
+# qualsiasi interruzione non controllata (riavvio manuale dell'operatore, BSOD,
+# riavvio imposto da Windows Update, crash dello script) viene comunque ripresa al
+# logon successivo. Idempotente: se il task esiste gia' (eredita' di una sessione
+# precedente) non rifa' la registrazione. Da chiamare appena lo script ha caricato
+# il piano d'esecuzione, prima di iniziare qualunque attivita' di provisioning.
+function Ensure-ResumeTaskActive {
+    param ([string]$User)
+    try {
+        if (Get-ScheduledTask -TaskName $resumeTaskName -ErrorAction SilentlyContinue) {
+            Write-Log "[OK] Attivita' pianificata '$resumeTaskName' gia' attiva: resume garantito ad ogni riavvio."
+            return
+        }
+    } catch {}
+    Write-Log "[INFO] Attivita' pianificata '$resumeTaskName' non presente: registrazione preventiva per garantire il resume."
+    if ([string]::IsNullOrWhiteSpace($User)) {
+        Register-ResumeTask
+    } else {
+        Register-ResumeTask -User $User
     }
 }
 
@@ -1066,10 +1090,17 @@ $domainUserName = if ($executionPlan.DomainUserName) { [string]$executionPlan.Do
 # dominio corrente del PC, quindi join e verifiche usano $plannedDomain.
 $plannedDomain = $domain
 
+# Resume always-on: il task di resume viene attivato SUBITO, appena conosciamo il
+# piano d'esecuzione, e rimosso solo agli stati realmente terminali (ShowSummary o
+# chiusura finale). Questo garantisce che qualsiasi riavvio - anche manuale o non
+# pianificato (es. utente che riavvia dopo un messaggio di Windows Update, crash,
+# kill della finestra PowerShell) - rilanci comunque lo script al logon successivo,
+# che riprendera' dal savepoint sul disco.
+Ensure-ResumeTaskActive
+
 # === Sezione 0: Resume da savepoint (stateFile JSON) ===
 if ($null -ne $resumeState) {
     Write-Log "=== Ripresa da savepoint: Action=$($resumeState.Action), Step=$($resumeState.Step) ==="
-    Unregister-ResumeTask
 
     # --- Ripresa dopo rinomina standalone ---
     if ($resumeState.Action -eq "RenameOnly") {
@@ -1129,7 +1160,10 @@ if ($null -ne $resumeState) {
     # --- Ripresa savepoint di progresso ---
     elseif ($resumeState.Action -eq "Progress") {
         Write-Log "Ripresa da savepoint progresso: Step=$($resumeState.Step)"
-        Unregister-ResumeTask
+        # Il task di resume resta volutamente registrato finche' lo script non
+        # raggiunge la chiusura finale: se l'esecuzione si interrompe di nuovo
+        # in mezzo (riavvio manuale, crash, Windows Update che impone reboot),
+        # al logon successivo verra' rilanciato dal task e ripartira' da qui.
     }
 
     # --- Stato sconosciuto: pulizia e proseguimento ---
