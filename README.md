@@ -129,7 +129,11 @@ Comandi WinGet usati:
 - Resume anomalo:
     - controllare `logs\JoinDomainState.txt`.
 - Auto-update script non eseguito:
-    - verificare `git` disponibile e repository inizializzato (`.git`).
+    - verificare `git` disponibile;
+    - se la cartella e' un download ZIP (manca `.git`), accettare il prompt
+      di bootstrap che lo script propone al primo avvio: viene clonato
+      `https://github.com/NiKiLLst/winget` e i file vengono allineati alla
+      versione su GitHub.
 
 ## Note operative per il team
 - Non committare file runtime/log (`logs/` e savepoint sono ignorati).

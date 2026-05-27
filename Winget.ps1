@@ -20,6 +20,10 @@ if (-not $isAdmin) {
 
 $scriptPath = $MyInvocation.MyCommand.Path
 
+# URL del repository GitHub ufficiale, usato per il bootstrap quando la cartella
+# locale non e' un clone git (tipico caso: download ZIP da GitHub, "winget-main").
+$script:GitHubRepoUrl = "https://github.com/NiKiLLst/winget.git"
+
 function Ensure-GitPrerequisiteForAutoUpdate {
     if (Get-Command git -ErrorAction SilentlyContinue) {
         return
@@ -50,6 +54,56 @@ function Ensure-GitPrerequisiteForAutoUpdate {
     }
 }
 
+function Initialize-RepoFromGitHub {
+    param(
+        [string]$repoPath,
+        [string]$repoUrl,
+        [string]$scriptToRun
+    )
+
+    # Bootstrap: se la cartella non e' un clone (tipico "winget-main" da ZIP)
+    # cloniamo il repo in una temp, copiamo .git nella cartella corrente e
+    # riallineamo i file alla versione GitHub. Cosi' i rilanci successivi
+    # avranno auto-update funzionante senza intervento manuale.
+
+    Write-Host ""
+    Write-Host "[INFO] Repository git non trovato in $repoPath (probabile download ZIP)."
+    $answer = Read-Host "Inizializzo la cartella come clone di $repoUrl per abilitare l'auto-update? Le eventuali modifiche locali a Winget.ps1 verranno sovrascritte. (S/N, default S)"
+    if ($answer -match '^[nN]$') {
+        Write-Host "[INFO] Bootstrap saltato: auto-update disabilitato per questa esecuzione."
+        return
+    }
+
+    $tempClone = Join-Path ([System.IO.Path]::GetTempPath()) ("winget-clone-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        Write-Host "[INFO] Clonazione di $repoUrl in $tempClone..."
+        & git clone --quiet $repoUrl $tempClone 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $tempClone ".git"))) {
+            Write-Host "[ATTENZIONE] git clone fallito (controlla connettivita' e URL): skip auto-update."
+            return
+        }
+
+        Write-Host "[INFO] Inizializzazione .git locale e allineamento file alla versione GitHub..."
+        Copy-Item -Recurse -Force -Path (Join-Path $tempClone ".git") -Destination $repoPath
+        & git -C $repoPath reset --hard HEAD 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ATTENZIONE] git reset --hard fallito dopo bootstrap: skip auto-update."
+            return
+        }
+
+        Write-Host "[OK] Repository inizializzato. Riavvio dello script aggiornato..."
+        $env:WINGET_SELFUPDATED = "1"
+        Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptToRun`""
+        exit
+    } catch {
+        Write-Host "[ATTENZIONE] Errore durante bootstrap repository: $_"
+    } finally {
+        if (Test-Path $tempClone) {
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempClone
+        }
+    }
+}
+
 function Ensure-LatestScriptFromGitHub {
     param(
         [string]$repoPath,
@@ -67,7 +121,8 @@ function Ensure-LatestScriptFromGitHub {
     }
 
     if (-not (Test-Path (Join-Path $repoPath ".git"))) {
-        Write-Host "[INFO] Repository git non trovato in $($repoPath): skip auto-update."
+        Initialize-RepoFromGitHub -repoPath $repoPath -repoUrl $script:GitHubRepoUrl -scriptToRun $scriptToRun
+        # Se siamo ancora qui il bootstrap e' stato saltato o e' fallito.
         return
     }
 
