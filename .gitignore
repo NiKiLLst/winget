@@ -4,3 +4,5 @@ logs/
 logs/JoinDomainState.txt
 # Ignora impostazioni locali di VS Code
 .vscode/
+# Impostazioni locali Claude Code (per-utente, non versionate)
+.claude/settings.local.json
