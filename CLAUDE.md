@@ -38,7 +38,7 @@ coordinated by a scheduled task and on-disk state files. Any edit to control flo
 
 Four runtime files live in `logs\` (gitignored, recreated each run):
 
-- `ExecutionPlan.json` — all initial user choices (target PC name, join flag, domain, selected apps,
+- `ExecutionPlan.json` — all initial user choices (user profile, target PC name, join flag, domain, selected apps,
   credential file paths, `DomainUserName`). Written once during the upfront input phase; read on every resume.
 - `JoinDomainState.txt` — the **savepoint**: a small JSON `{Action, Step, ...}`. Its presence means
   "this is a resume, not a fresh start." `Action` is one of `RenameOnly`, `JoinDomain`, `Progress`,
@@ -58,7 +58,7 @@ Execution model:
 1. **Self-elevation + self-update** run unconditionally first. `$env:WINGET_SELFUPDATED` guards
    against an infinite relaunch loop after a successful `git pull`.
 2. **Upfront input phase** (only when no savepoint exists): *all* interactive prompts happen here, in
-   this order — local admin user, domain join + domain, join-admin credentials, end-user domain
+   this order — user profile (Aziendale by default, or Filippo), local admin user, domain join + domain, join-admin credentials, end-user domain
    credentials, PC name + confirm. Domain/credentials are gathered *before* the PC name because the
    name's availability check needs them. Credentials are verified against the domain as they are
    entered (`Get-TestedDomainCredential` → `Test-DomainCredential`). After this the run is fully
@@ -101,3 +101,4 @@ section and the `ShowSummary` branch).
 - `$domain = "test.local"` (in `Winget.ps1`) — placeholder default domain; the real domain is
   normally supplied interactively.
 - `$availableApps` — the install candidate list; commenting a line with `#` excludes that app.
+- `$filippoApps` — extra candidates offered only with the Filippo profile, on top of `$availableApps`.

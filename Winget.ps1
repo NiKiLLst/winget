@@ -250,6 +250,29 @@ $availableApps = @(
     "FlipperDevicesInc.qFlipper"
 )
 
+# Applicazioni aggiuntive proposte solo con il profilo "Filippo"
+$filippoApps = @(
+    # Amministrazione
+    "WinSCP.WinSCP",
+    "Rufus.Rufus",
+    "Rclone.Rclone",
+    # Sviluppo
+    "GitHub.cli",
+    "OpenJS.NodeJS.LTS",
+    "Python.Python.3.14",
+    "Anthropic.ClaudeCode",
+    # Segreti
+    "AgileBits.1Password",
+    "AgileBits.1Password.CLI",
+    "FiloSottile.age",
+    "SecretsOPerationS.SOPS",
+    # Rete
+    "Tailscale.Tailscale",
+    "WireGuard.WireGuard",
+    "Cloudflare.cloudflared",
+    "MoonlightGameStreamingProject.Moonlight"
+)
+
 $apps = @()
 $joinRequested = $false
 $desiredComputerName = $env:COMPUTERNAME
@@ -551,6 +574,21 @@ function Read-ExecutionPlan {
         Write-Log "[ATTENZIONE] Piano di esecuzione non leggibile: $_"
     }
     return $null
+}
+
+# Chiede il profilo utente. Il default e' Aziendale: Invio o risposta non riconosciuta.
+function Select-UserProfile {
+    Write-Host ""
+    Write-Host "Profilo utente:"
+    Write-Host "  1 = Aziendale (default)"
+    Write-Host "  2 = Filippo (lista aziendale + app personali)"
+    $answer = Read-Host "Seleziona il profilo (1/2, Invio=1)"
+    if ($answer -match '^\s*(2|f|filippo)\s*$') {
+        Write-Host "  -> Profilo: Filippo"
+        return "Filippo"
+    }
+    Write-Host "  -> Profilo: Aziendale"
+    return "Aziendale"
 }
 
 function Select-AppsForInstallation {
@@ -1016,6 +1054,8 @@ if ($null -eq $resumeState) {
     # Tutte le domande utente vengono fatte in una fase unica iniziale.
     # Ordine: il dominio e le credenziali servono per verificare il nome PC in AD,
     # quindi vengono richiesti prima del nome PC.
+    $planProfile = Select-UserProfile
+    Write-Log "Profilo utente selezionato: $planProfile"
     New-LocalAdminUser
     Write-Host "`n"
 
@@ -1107,10 +1147,13 @@ if ($null -eq $resumeState) {
     } while (-not $pcNameAccepted)
 
     # --- Selezione applicazioni ---
-    $selectedApps = Select-AppsForInstallation -candidateApps $availableApps
+    $candidateApps = @($availableApps)
+    if ($planProfile -eq "Filippo") { $candidateApps += $filippoApps }
+    $selectedApps = Select-AppsForInstallation -candidateApps $candidateApps
 
     # --- Salvataggio credenziali e piano di esecuzione ---
     $executionPlan = [ordered]@{
+        UserProfile              = $planProfile
         DesiredComputerName      = $planPCName
         JoinDomain               = $planJoin
         Domain                   = $planDomain

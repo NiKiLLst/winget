@@ -44,6 +44,7 @@ Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
 ## Domande iniziali (una sola fase)
 In assenza di resume, lo script chiede, in quest'ordine:
+- Profilo utente: `1` = Aziendale (default, anche con `Invio`), `2` = Filippo.
 - Creazione utente locale admin (opzionale).
 - Join dominio (`y/n`).
 - Dominio target (se join attivo) con conferma esplicita.
@@ -104,6 +105,12 @@ Lista base nello script (`$availableApps`):
 - `Microsoft.VisualStudioCode`
 - `Git.Git`
 - `FlipperDevicesInc.qFlipper`
+
+Solo con profilo Filippo (`$filippoApps`, in aggiunta alla lista base):
+- `WinSCP.WinSCP`, `Rufus.Rufus`, `Rclone.Rclone`
+- `GitHub.cli`, `OpenJS.NodeJS.LTS`, `Python.Python.3.14`, `Anthropic.ClaudeCode`
+- `AgileBits.1Password`, `AgileBits.1Password.CLI`, `FiloSottile.age`, `SecretsOPerationS.SOPS`
+- `Tailscale.Tailscale`, `WireGuard.WireGuard`, `Cloudflare.cloudflared`, `MoonlightGameStreamingProject.Moonlight`
 
 Comandi WinGet usati:
 - `winget list -e --id <ID> --source winget`
